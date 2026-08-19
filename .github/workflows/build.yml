@@ -36,10 +36,15 @@ jobs:
 
           curl -fsSL "$BASE/java/org/drinkless/tdlib/TdApi.java" -o app/src/main/java/org/drinkless/tdlib/TdApi.java
           curl -fsSL "$BASE/java/org/drinkless/tdlib/Client.java" -o app/src/main/java/org/drinkless/tdlib/Client.java
-          curl -fsSL "$BASE/jniLibs/arm64-v8a/libtdjni.so" -o app/src/main/jniLibs/arm64-v8a/libtdjni.so
-          curl -fsSL "$BASE/jniLibs/armeabi-v7a/libtdjni.so" -o app/src/main/jniLibs/armeabi-v7a/libtdjni.so
-          curl -fsSL "$BASE/jniLibs/x86/libtdjni.so" -o app/src/main/jniLibs/x86/libtdjni.so
-          curl -fsSL "$BASE/jniLibs/x86_64/libtdjni.so" -o app/src/main/jniLibs/x86_64/libtdjni.so
+
+          # libtdjni.so depends on libsslx.so and libcryptox.so (TDLib's own
+          # renamed OpenSSL/BoringSSL build) - all three must be present
+          # side by side in every ABI folder or dlopen fails at runtime.
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            for lib in libtdjni.so libsslx.so libcryptox.so; do
+              curl -fsSL "$BASE/jniLibs/$abi/$lib" -o "app/src/main/jniLibs/$abi/$lib"
+            done
+          done
 
           echo "Downloaded files:"
           find app/src/main/java/org/drinkless app/src/main/jniLibs -type f -exec ls -la {} \;

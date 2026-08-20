@@ -44,25 +44,33 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
     private val cacheLock = Any()
 
     override fun serve(session: IHTTPSession): Response {
+        FileLogger.log("HTTP request: ${session.method} ${session.uri}?${session.queryParameterString}")
         return when (session.uri) {
             "/video" -> serveVideo(session)
             "/catalog" -> serveCatalog(session)
-            else -> newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "not found")
+            else -> {
+                FileLogger.log("Unknown route requested: ${session.uri}")
+                newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "not found")
+            }
         }
     }
 
     private fun serveCatalog(session: IHTTPSession): Response {
         val channelId = session.parameters["channel_id"]?.firstOrNull()?.toLongOrNull()
         if (channelId == null) {
+            FileLogger.error("Catalog request missing channel_id")
             return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "missing channel_id")
         }
         val forceRefresh = session.parameters["refresh"]?.firstOrNull() == "1"
+        FileLogger.log("Building catalog for channelId=$channelId forceRefresh=$forceRefresh")
 
         return try {
             val items = runBlocking { ChannelCatalogBuilder.getCatalog(channelId, forceRefresh) }
+            FileLogger.log("Catalog built: ${items.size} item(s)")
             val json = ChannelCatalogBuilder.toJson(items)
             newFixedLengthResponse(Response.Status.OK, "application/json", json)
         } catch (e: Exception) {
+            FileLogger.error("Catalog build failed", e)
             newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "catalog build failed: ${e.message}")
         }
     }
@@ -72,12 +80,15 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
         val chatId = params["chat_id"]?.firstOrNull()?.toLongOrNull()
         val messageId = params["message_id"]?.firstOrNull()?.toLongOrNull()
         if (chatId == null || messageId == null) {
+            FileLogger.error("Video request missing chat_id/message_id")
             return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "missing chat_id/message_id")
         }
+        FileLogger.log("Video requested: chatId=$chatId messageId=$messageId range=${session.headers["range"]}")
 
         val entry = try {
             getOrResolve(chatId, messageId)
         } catch (e: Exception) {
+            FileLogger.error("Resolve failed for chatId=$chatId messageId=$messageId", e)
             return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "resolve failed: ${e.message}")
         }
 

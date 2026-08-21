@@ -70,6 +70,7 @@ object ChannelCatalogBuilder {
     }
 
     private suspend fun build(chatId: Long): List<ChannelItem> {
+        FileLogger.log("ChannelCatalogBuilder: starting build for chatId=$chatId")
         val client = TelegramClient.rawClient()
 
         // Ensure TDLib has the chat loaded before requesting its history.
@@ -92,6 +93,7 @@ object ChannelCatalogBuilder {
             }
 
             val batch = messages.messages?.filterNotNull() ?: emptyList()
+            FileLogger.log("ChannelCatalogBuilder: page fetched ${batch.size} message(s), running total will be ${fetched + batch.size}")
             if (batch.isEmpty()) break
 
             for (message in batch) {
@@ -109,10 +111,16 @@ object ChannelCatalogBuilder {
 
             fetched += batch.size
             fromMessageId = batch.last().id
-            if (batch.size < batchSize) break // reached the start of the chat
+            // NOTE: do NOT stop just because this batch was smaller than
+            // requested - right after login TDLib may not have finished
+            // syncing the chat's full history yet, and a small early batch
+            // does not mean "reached the start of the chat." The only
+            // trustworthy stop signal is a genuinely empty batch (checked
+            // at the top of the loop). Stopping early here was exactly why
+            // a fresh login needed two refreshes to see the full catalog.
         }
 
-        return grouped.map { (baseName, parts) ->
+        val result = grouped.map { (baseName, parts) ->
             val sortedParts = parts.sortedBy { it.originalName }
             ChannelItem(
                 title = baseName.replace('.', ' ').replaceFirstChar { it.uppercase() },
@@ -120,5 +128,7 @@ object ChannelCatalogBuilder {
                 parts = sortedParts
             )
         }
+        FileLogger.log("ChannelCatalogBuilder: build complete, ${result.size} item(s) from ${fetched} message(s) scanned")
+        return result
     }
 }

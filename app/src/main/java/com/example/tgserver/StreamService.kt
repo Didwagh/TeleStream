@@ -8,118 +8,142 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
-import io.ktor.http.*
-import io.ktor.server.application.*
-import io.ktor.server.cio.*
-import io.ktor.server.engine.*
-import io.ktor.server.plugins.cors.routing.*
-import io.ktor.server.response.*
-import io.ktor.server.routing.*
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
+import com.sun.net.httpserver.HttpExchange
+import com.sun.net.httpserver.HttpHandler
+import com.sun.net.httpserver.HttpServer
 import java.io.File
+import java.io.FileInputStream
+import java.io.OutputStream
 import java.io.RandomAccessFile
+import java.net.InetSocketAddress
+import java.util.concurrent.Executors
 
 class StreamService : Service() {
 
     companion object {
         const val PORT = 38471
-        // BIND TO 0.0.0.0 SO IT ACCEPTS LAN (192.168.0.x) AND LOCALHOST (127.0.0.1)
-        const val HOST = "0.0.0.0"
+        var isRunning: Boolean = false
     }
 
-    private var server: EmbeddedServer<*, *>? = null
+    private var server: HttpServer? = null
+    private val executor = Executors.newFixedThreadPool(8)
 
     override fun onCreate() {
         super.onCreate()
         startForegroundService()
-        startHttpServer()
+        startServer()
     }
 
-    private fun startHttpServer() {
-        server = embeddedServer(CIO, port = PORT, host = HOST) {
-            install(CORS) {
-                anyHost()
-                allowHeader(HttpHeaders.ContentType)
-                allowHeader(HttpHeaders.Range)
-                allowHeader(HttpHeaders.AcceptRanges)
-            }
+    private fun startServer() {
+        try {
+            // Bind to 0.0.0.0 so both 127.0.0.1 and 192.168.0.194 can connect
+            server = HttpServer.create(InetSocketAddress("0.0.0.0", PORT), 0).apply {
+                executor = this@StreamService.executor
 
-            routing {
-                // 1. Catalog Endpoint
-                get("/catalog") {
-                    val channelId = call.request.queryParameters["channel_id"]?.toLongOrNull() ?: -1004374443616L
-                    val forceRefresh = call.request.queryParameters["refresh"] == "1"
-
-                    // Retrieve cached/built catalog from your CatalogRepository / TDLib
-                    val catalogJson = CatalogManager.getCatalogJson(channelId, forceRefresh)
-                    
-                    call.response.header(HttpHeaders.ContentType, "application/json; charset=utf-8")
-                    call.respondText(catalogJson, ContentType.Application.Json)
+                createContext("/catalog") { exchange ->
+                    handleCatalog(exchange)
                 }
 
-                // 2. Video Streaming Endpoint with 206 Partial Content & Range Support
-                get("/video") {
-                    val chatId = call.request.queryParameters["chat_id"]?.toLongOrNull()
-                    val messageId = call.request.queryParameters["message_id"]?.toLongOrNull()
+                createContext("/video") { exchange ->
+                    handleVideo(exchange)
+                }
 
-                    if (chatId == null || messageId == null) {
-                        call.respond(HttpStatusCode.BadRequest, "Missing chat_id or message_id")
-                        return@get
-                    }
+                start()
+            }
+            isRunning = true
+        } catch (e: Exception) {
+            e.printStackTrace()
+            isRunning = false
+        }
+    }
 
-                    // Get the downloaded/downloading file path from TDLib
-                    val file = VideoFileManager.getVideoFile(chatId, messageId)
-                    if (file == null || !file.exists()) {
-                        call.respond(HttpStatusCode.NotFound, "Video file not ready or not found")
-                        return@get
-                    }
+    private fun handleCatalog(exchange: HttpExchange) {
+        val query = exchange.requestURI.query ?: ""
+        val params = query.split("&").associate {
+            val parts = it.split("=")
+            if (parts.size == 2) parts[0] to parts[1] else "" to ""
+        }
 
-                    val fileLength = file.length()
-                    val rangeHeader = call.request.headers[HttpHeaders.Range]
+        val channelId = params["channel_id"]?.toLongOrNull() ?: -1004374443616L
+        val forceRefresh = params["refresh"] == "1"
 
-                    if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
-                        val ranges = rangeHeader.removePrefix("bytes=").split("-")
-                        val start = ranges[0].toLongOrNull() ?: 0L
-                        val end = if (ranges.size > 1 && ranges[1].isNotBlank()) {
-                            ranges[1].toLongOrNull() ?: (fileLength - 1)
-                        } else {
-                            fileLength - 1
-                        }
+        // Use your existing ChannelCatalogBuilder / cache
+        val catalogJson = try {
+            CatalogManager.getCatalogJson(channelId, forceRefresh)
+        } catch (e: Exception) {
+            "[]"
+        }
 
-                        val contentLength = (end - start) + 1
+        val bytes = catalogJson.toByteArray(Charsets.UTF_8)
+        exchange.responseHeaders.set("Content-Type", "application/json; charset=utf-8")
+        exchange.responseHeaders.set("Access-Control-Allow-Origin", "*")
+        exchange.sendResponseHeaders(200, bytes.size.toLong())
+        exchange.responseBody.use { it.write(bytes) }
+    }
 
-                        call.response.status(HttpStatusCode.PartialContent)
-                        call.response.header(HttpHeaders.AcceptRanges, "bytes")
-                        call.response.header(HttpHeaders.ContentRange, "bytes $start-$end/$fileLength")
-                        call.response.header(HttpHeaders.ContentType, "video/mp4")
-                        call.response.header(HttpHeaders.ContentLength, contentLength.toString())
+    private fun handleVideo(exchange: HttpExchange) {
+        val query = exchange.requestURI.query ?: ""
+        val params = query.split("&").associate {
+            val parts = it.split("=")
+            if (parts.size == 2) parts[0] to parts[1] else "" to ""
+        }
 
-                        call.respondOutputStream(ContentType.parse("video/mp4"), HttpStatusCode.PartialContent) {
-                            RandomAccessFile(file, "r").use { raf ->
-                                raf.seek(start)
-                                val buffer = ByteArray(64 * 1024)
-                                var bytesToRead = contentLength
-                                while (bytesToRead > 0) {
-                                    val read = raf.read(buffer, 0, minOf(buffer.size.toLong(), bytesToRead).toInt())
-                                    if (read == -1) break
-                                    write(buffer, 0, read)
-                                    bytesToRead -= read
-                                }
-                            }
-                        }
-                    } else {
-                        // Full Content (Status 200)
-                        call.response.status(HttpStatusCode.OK)
-                        call.response.header(HttpHeaders.AcceptRanges, "bytes")
-                        call.response.header(HttpHeaders.ContentLength, fileLength.toString())
-                        call.response.header(HttpHeaders.ContentType, "video/mp4")
-                        call.respondFile(file)
+        val chatId = params["chat_id"]?.toLongOrNull()
+        val messageId = params["message_id"]?.toLongOrNull()
+
+        if (chatId == null || messageId == null) {
+            exchange.sendResponseHeaders(400, -1)
+            return
+        }
+
+        val file = VideoFileManager.getVideoFile(chatId, messageId)
+        if (file == null || !file.exists()) {
+            exchange.sendResponseHeaders(404, -1)
+            return
+        }
+
+        val fileLength = file.length()
+        val rangeHeader = exchange.requestHeaders.getFirst("Range")
+
+        exchange.responseHeaders.set("Accept-Ranges", "bytes")
+        exchange.responseHeaders.set("Content-Type", "video/mp4")
+        exchange.responseHeaders.set("Access-Control-Allow-Origin", "*")
+
+        if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
+            val ranges = rangeHeader.removePrefix("bytes=").split("-")
+            val start = ranges[0].toLongOrNull() ?: 0L
+            val end = if (ranges.size > 1 && ranges[1].isNotBlank()) {
+                ranges[1].toLongOrNull() ?: (fileLength - 1)
+            } else {
+                fileLength - 1
+            }
+
+            val contentLength = (end - start) + 1
+            exchange.responseHeaders.set("Content-Range", "bytes $start-$end/$fileLength")
+            exchange.sendResponseHeaders(206, contentLength)
+
+            RandomAccessFile(file, "r").use { raf ->
+                raf.seek(start)
+                val buffer = ByteArray(64 * 1024)
+                var bytesRemaining = contentLength
+                exchange.responseBody.use { out ->
+                    while (bytesRemaining > 0) {
+                        val toRead = minOf(buffer.size.toLong(), bytesRemaining).toInt()
+                        val read = raf.read(buffer, 0, toRead)
+                        if (read == -1) break
+                        out.write(buffer, 0, read)
+                        bytesRemaining -= read
                     }
                 }
             }
-        }.start(wait = false)
+        } else {
+            exchange.sendResponseHeaders(200, fileLength)
+            FileInputStream(file).use { input ->
+                exchange.responseBody.use { out ->
+                    input.copyTo(out)
+                }
+            }
+        }
     }
 
     private fun startForegroundService() {
@@ -140,7 +164,9 @@ class StreamService : Service() {
     }
 
     override fun onDestroy() {
-        server?.stop(1000, 2000)
+        isRunning = false
+        server?.stop(0)
+        executor.shutdown()
         super.onDestroy()
     }
 

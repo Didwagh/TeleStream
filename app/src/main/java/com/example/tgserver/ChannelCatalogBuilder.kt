@@ -1,5 +1,7 @@
 package com.example.tgserver
 
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.suspendCancellableCoroutine
 import org.drinkless.tdlib.TdApi
 import org.json.JSONArray
@@ -37,15 +39,50 @@ object ChannelCatalogBuilder {
 
     private var cache: List<ChannelItem>? = null
     private var cachedChatId: Long? = null
+    private val buildLock = Mutex()
+    @Volatile private var isBuilding = false
 
+    /**
+     * Returns instantly, NEVER triggers a build, NEVER blocks. This is what
+     * /catalog should call for ordinary requests (i.e. from CloudStream) -
+     * a slow rebuild must never happen inside a request CloudStream's own
+     * HTTP client is waiting on, since that client has its own timeout we
+     * don't control. Returns null if nothing has been built yet for this
+     * chatId.
+     */
+    fun peekCache(chatId: Long): List<ChannelItem>? {
+        return if (cachedChatId == chatId) cache else null
+    }
+
+    fun isCurrentlyBuilding(): Boolean = isBuilding
+
+    /**
+     * The actual (slow) build, guarded by a lock so concurrent callers
+     * (e.g. the auto-refresh on server start firing at the same moment as
+     * a manual refresh tap) don't race each other and both hammer TDLib at
+     * once - whoever asks first builds, everyone else just waits for that
+     * same result instead of starting a second redundant build.
+     */
     suspend fun getCatalog(chatId: Long, forceRefresh: Boolean = false): List<ChannelItem> {
         if (!forceRefresh && cachedChatId == chatId && cache != null) {
             return cache!!
         }
-        val items = build(chatId)
-        cache = items
-        cachedChatId = chatId
-        return items
+        return buildLock.withLock {
+            // Re-check after acquiring the lock - another caller may have
+            // just finished building while we were waiting for the lock.
+            if (!forceRefresh && cachedChatId == chatId && cache != null) {
+                return@withLock cache!!
+            }
+            isBuilding = true
+            try {
+                val items = build(chatId)
+                cache = items
+                cachedChatId = chatId
+                items
+            } finally {
+                isBuilding = false
+            }
+        }
     }
 
     fun toJson(items: List<ChannelItem>): String {

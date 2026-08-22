@@ -1,6 +1,9 @@
 package com.example.tgserver
 
 import fi.iki.elonen.NanoHTTPD
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import java.io.InputStream
 
@@ -42,6 +45,7 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
 
     private val cache = HashMap<String, Entry>()
     private val cacheLock = Any()
+    private val serverScope = CoroutineScope(Dispatchers.IO)
 
     override fun serve(session: IHTTPSession): Response {
         FileLogger.log("HTTP request: ${session.method} ${session.uri}?${session.queryParameterString}")
@@ -62,17 +66,48 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
             return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "missing channel_id")
         }
         val forceRefresh = session.parameters["refresh"]?.firstOrNull() == "1"
-        FileLogger.log("Building catalog for channelId=$channelId forceRefresh=$forceRefresh")
+        FileLogger.log("Catalog request: channelId=$channelId forceRefresh=$forceRefresh")
 
-        return try {
-            val items = runBlocking { ChannelCatalogBuilder.getCatalog(channelId, forceRefresh) }
-            FileLogger.log("Catalog built: ${items.size} item(s)")
-            val json = ChannelCatalogBuilder.toJson(items)
-            newFixedLengthResponse(Response.Status.OK, "application/json", json)
-        } catch (e: Exception) {
-            FileLogger.error("Catalog build failed", e)
-            newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "catalog build failed: ${e.message}")
+        if (forceRefresh) {
+            // Explicit, deliberate action (manual refresh button or browser
+            // test) - acceptable to actually wait here, since the caller
+            // asked for a fresh rebuild on purpose and has its own "loading"
+            // feedback while it waits.
+            return try {
+                val items = runBlocking { ChannelCatalogBuilder.getCatalog(channelId, true) }
+                FileLogger.log("Catalog rebuilt (blocking, requested): ${items.size} item(s)")
+                newFixedLengthResponse(Response.Status.OK, "application/json", ChannelCatalogBuilder.toJson(items))
+            } catch (e: Exception) {
+                FileLogger.error("Catalog rebuild failed", e)
+                newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "catalog build failed: ${e.message}")
+            }
         }
+
+        // Ordinary request (this is what CloudStream calls) - NEVER block
+        // on a rebuild here. CloudStream's own HTTP client has a timeout we
+        // don't control, and a slow TDLib pagination walk inside this
+        // request is exactly what was causing "SocketTimeoutException" on
+        // the CloudStream side. Answer instantly from cache, and silently
+        // kick off a background rebuild if nothing is cached yet or if the
+        // cache looks stale - by the time the person taps play, it'll very
+        // likely already be warm.
+        val cached = ChannelCatalogBuilder.peekCache(channelId)
+        if (cached == null) {
+            if (!ChannelCatalogBuilder.isCurrentlyBuilding()) {
+                FileLogger.log("No cache yet for channelId=$channelId - triggering background build")
+                serverScope.launch {
+                    try {
+                        ChannelCatalogBuilder.getCatalog(channelId, forceRefresh = false)
+                    } catch (e: Exception) {
+                        FileLogger.error("Background catalog build failed", e)
+                    }
+                }
+            }
+            return newFixedLengthResponse(Response.Status.OK, "application/json", "[]")
+        }
+
+        FileLogger.log("Serving cached catalog instantly: ${cached.size} item(s)")
+        return newFixedLengthResponse(Response.Status.OK, "application/json", ChannelCatalogBuilder.toJson(cached))
     }
 
     private fun serveVideo(session: IHTTPSession): Response {

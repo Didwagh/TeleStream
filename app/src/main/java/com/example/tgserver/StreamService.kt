@@ -8,88 +8,141 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import io.ktor.http.*
+import io.ktor.server.application.*
+import io.ktor.server.cio.*
+import io.ktor.server.engine.*
+import io.ktor.server.plugins.cors.routing.*
+import io.ktor.server.response.*
+import io.ktor.server.routing.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import java.io.File
+import java.io.RandomAccessFile
 
 class StreamService : Service() {
 
     companion object {
         const val PORT = 38471
-        private const val CHANNEL_ID = "tg_stream_channel"
-        private const val NOTIFICATION_ID = 1
-
-        var isRunning = false
-            private set
+        // BIND TO 0.0.0.0 SO IT ACCEPTS LAN (192.168.0.x) AND LOCALHOST (127.0.0.1)
+        const val HOST = "0.0.0.0"
     }
 
-    private var server: LocalStreamServer? = null
-    private val serviceScope = CoroutineScope(Dispatchers.IO)
+    private var server: EmbeddedServer<*, *>? = null
 
     override fun onCreate() {
         super.onCreate()
-        createChannel()
+        startForegroundService()
+        startHttpServer()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIFICATION_ID, buildNotification())
-        if (server == null) {
-            server = LocalStreamServer(PORT).also { it.start(10_000, false) }
-            isRunning = true
-            warmUpCatalog()
-        }
-        return START_STICKY
-    }
-
-    /**
-     * Builds the catalog once automatically as soon as the server starts,
-     * so it's already warm by the time you open CloudStream - rather than
-     * waiting for a manual tap. This runs in the background and does not
-     * block the server from serving /video requests in the meantime.
-     */
-    private fun warmUpCatalog() {
-        val prefs = getSharedPreferences("tgserver_prefs", MODE_PRIVATE)
-        val channelId = prefs.getLong("channel_id", 0L)
-        if (channelId == 0L) {
-            FileLogger.log("warmUpCatalog: no channel_id saved yet, skipping")
-            return
-        }
-        serviceScope.launch {
-            try {
-                FileLogger.log("warmUpCatalog: building catalog for channelId=$channelId on server start")
-                val items = ChannelCatalogBuilder.getCatalog(channelId, forceRefresh = true)
-                FileLogger.log("warmUpCatalog: done, ${items.size} item(s) ready")
-            } catch (e: Exception) {
-                FileLogger.error("warmUpCatalog failed", e)
+    private fun startHttpServer() {
+        server = embeddedServer(CIO, port = PORT, host = HOST) {
+            install(CORS) {
+                anyHost()
+                allowHeader(HttpHeaders.ContentType)
+                allowHeader(HttpHeaders.Range)
+                allowHeader(HttpHeaders.AcceptRanges)
             }
+
+            routing {
+                // 1. Catalog Endpoint
+                get("/catalog") {
+                    val channelId = call.request.queryParameters["channel_id"]?.toLongOrNull() ?: -1004374443616L
+                    val forceRefresh = call.request.queryParameters["refresh"] == "1"
+
+                    // Retrieve cached/built catalog from your CatalogRepository / TDLib
+                    val catalogJson = CatalogManager.getCatalogJson(channelId, forceRefresh)
+                    
+                    call.response.header(HttpHeaders.ContentType, "application/json; charset=utf-8")
+                    call.respondText(catalogJson, ContentType.Application.Json)
+                }
+
+                // 2. Video Streaming Endpoint with 206 Partial Content & Range Support
+                get("/video") {
+                    val chatId = call.request.queryParameters["chat_id"]?.toLongOrNull()
+                    val messageId = call.request.queryParameters["message_id"]?.toLongOrNull()
+
+                    if (chatId == null || messageId == null) {
+                        call.respond(HttpStatusCode.BadRequest, "Missing chat_id or message_id")
+                        return@get
+                    }
+
+                    // Get the downloaded/downloading file path from TDLib
+                    val file = VideoFileManager.getVideoFile(chatId, messageId)
+                    if (file == null || !file.exists()) {
+                        call.respond(HttpStatusCode.NotFound, "Video file not ready or not found")
+                        return@get
+                    }
+
+                    val fileLength = file.length()
+                    val rangeHeader = call.request.headers[HttpHeaders.Range]
+
+                    if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
+                        val ranges = rangeHeader.removePrefix("bytes=").split("-")
+                        val start = ranges[0].toLongOrNull() ?: 0L
+                        val end = if (ranges.size > 1 && ranges[1].isNotBlank()) {
+                            ranges[1].toLongOrNull() ?: (fileLength - 1)
+                        } else {
+                            fileLength - 1
+                        }
+
+                        val contentLength = (end - start) + 1
+
+                        call.response.status(HttpStatusCode.PartialContent)
+                        call.response.header(HttpHeaders.AcceptRanges, "bytes")
+                        call.response.header(HttpHeaders.ContentRange, "bytes $start-$end/$fileLength")
+                        call.response.header(HttpHeaders.ContentType, "video/mp4")
+                        call.response.header(HttpHeaders.ContentLength, contentLength.toString())
+
+                        call.respondOutputStream(ContentType.parse("video/mp4"), HttpStatusCode.PartialContent) {
+                            RandomAccessFile(file, "r").use { raf ->
+                                raf.seek(start)
+                                val buffer = ByteArray(64 * 1024)
+                                var bytesToRead = contentLength
+                                while (bytesToRead > 0) {
+                                    val read = raf.read(buffer, 0, minOf(buffer.size.toLong(), bytesToRead).toInt())
+                                    if (read == -1) break
+                                    write(buffer, 0, read)
+                                    bytesToRead -= read
+                                }
+                            }
+                        }
+                    } else {
+                        // Full Content (Status 200)
+                        call.response.status(HttpStatusCode.OK)
+                        call.response.header(HttpHeaders.AcceptRanges, "bytes")
+                        call.response.header(HttpHeaders.ContentLength, fileLength.toString())
+                        call.response.header(HttpHeaders.ContentType, "video/mp4")
+                        call.respondFile(file)
+                    }
+                }
+            }
+        }.start(wait = false)
+    }
+
+    private fun startForegroundService() {
+        val channelId = "tgserver_stream_channel"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(channelId, "TeleStream Server", NotificationManager.IMPORTANCE_LOW)
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.createNotificationChannel(channel)
         }
+
+        val notification: Notification = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("TeleStream Service Running")
+            .setContentText("Listening on 0.0.0.0:$PORT")
+            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .build()
+
+        startForeground(1001, notification)
     }
 
     override fun onDestroy() {
-        server?.stop()
-        server = null
-        isRunning = false
+        server?.stop(1000, 2000)
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
-
-    private fun createChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID, "Telegram Stream Server", NotificationManager.IMPORTANCE_LOW
-            )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
-        }
-    }
-
-    private fun buildNotification(): Notification {
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Telegram Stream Server")
-            .setContentText("Running on port $PORT — keep this running while using CloudStream")
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .setOngoing(true)
-            .build()
-    }
 }

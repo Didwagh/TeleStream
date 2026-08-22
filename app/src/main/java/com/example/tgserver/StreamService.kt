@@ -8,167 +8,88 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
-import com.sun.net.httpserver.HttpExchange
-import com.sun.net.httpserver.HttpHandler
-import com.sun.net.httpserver.HttpServer
-import java.io.File
-import java.io.FileInputStream
-import java.io.OutputStream
-import java.io.RandomAccessFile
-import java.net.InetSocketAddress
-import java.util.concurrent.Executors
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 class StreamService : Service() {
 
     companion object {
         const val PORT = 38471
-        var isRunning: Boolean = false
+        private const val CHANNEL_ID = "tg_stream_channel"
+        private const val NOTIFICATION_ID = 1
+
+        var isRunning = false
+            private set
     }
 
-    private var server: HttpServer? = null
-    private val executor = Executors.newFixedThreadPool(8)
+    private var server: LocalStreamServer? = null
+    private val serviceScope = CoroutineScope(Dispatchers.IO)
 
     override fun onCreate() {
         super.onCreate()
-        startForegroundService()
-        startServer()
+        createChannel()
     }
 
-    private fun startServer() {
-        try {
-            // Bind to 0.0.0.0 so both 127.0.0.1 and 192.168.0.194 can connect
-            server = HttpServer.create(InetSocketAddress("0.0.0.0", PORT), 0).apply {
-                executor = this@StreamService.executor
-
-                createContext("/catalog") { exchange ->
-                    handleCatalog(exchange)
-                }
-
-                createContext("/video") { exchange ->
-                    handleVideo(exchange)
-                }
-
-                start()
-            }
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        startForeground(NOTIFICATION_ID, buildNotification())
+        if (server == null) {
+            server = LocalStreamServer(PORT).also { it.start(10_000, false) }
             isRunning = true
-        } catch (e: Exception) {
-            e.printStackTrace()
-            isRunning = false
+            warmUpCatalog()
         }
+        return START_STICKY
     }
 
-    private fun handleCatalog(exchange: HttpExchange) {
-        val query = exchange.requestURI.query ?: ""
-        val params = query.split("&").associate {
-            val parts = it.split("=")
-            if (parts.size == 2) parts[0] to parts[1] else "" to ""
-        }
-
-        val channelId = params["channel_id"]?.toLongOrNull() ?: -1004374443616L
-        val forceRefresh = params["refresh"] == "1"
-
-        // Use your existing ChannelCatalogBuilder / cache
-        val catalogJson = try {
-            CatalogManager.getCatalogJson(channelId, forceRefresh)
-        } catch (e: Exception) {
-            "[]"
-        }
-
-        val bytes = catalogJson.toByteArray(Charsets.UTF_8)
-        exchange.responseHeaders.set("Content-Type", "application/json; charset=utf-8")
-        exchange.responseHeaders.set("Access-Control-Allow-Origin", "*")
-        exchange.sendResponseHeaders(200, bytes.size.toLong())
-        exchange.responseBody.use { it.write(bytes) }
-    }
-
-    private fun handleVideo(exchange: HttpExchange) {
-        val query = exchange.requestURI.query ?: ""
-        val params = query.split("&").associate {
-            val parts = it.split("=")
-            if (parts.size == 2) parts[0] to parts[1] else "" to ""
-        }
-
-        val chatId = params["chat_id"]?.toLongOrNull()
-        val messageId = params["message_id"]?.toLongOrNull()
-
-        if (chatId == null || messageId == null) {
-            exchange.sendResponseHeaders(400, -1)
+    /**
+     * Builds the catalog once automatically as soon as the server starts,
+     * so it's already warm by the time you open CloudStream - rather than
+     * waiting for a manual tap. This runs in the background and does not
+     * block the server from serving /video requests in the meantime.
+     */
+    private fun warmUpCatalog() {
+        val prefs = getSharedPreferences("tgserver_prefs", MODE_PRIVATE)
+        val channelId = prefs.getLong("channel_id", 0L)
+        if (channelId == 0L) {
+            FileLogger.log("warmUpCatalog: no channel_id saved yet, skipping")
             return
         }
-
-        val file = VideoFileManager.getVideoFile(chatId, messageId)
-        if (file == null || !file.exists()) {
-            exchange.sendResponseHeaders(404, -1)
-            return
-        }
-
-        val fileLength = file.length()
-        val rangeHeader = exchange.requestHeaders.getFirst("Range")
-
-        exchange.responseHeaders.set("Accept-Ranges", "bytes")
-        exchange.responseHeaders.set("Content-Type", "video/mp4")
-        exchange.responseHeaders.set("Access-Control-Allow-Origin", "*")
-
-        if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
-            val ranges = rangeHeader.removePrefix("bytes=").split("-")
-            val start = ranges[0].toLongOrNull() ?: 0L
-            val end = if (ranges.size > 1 && ranges[1].isNotBlank()) {
-                ranges[1].toLongOrNull() ?: (fileLength - 1)
-            } else {
-                fileLength - 1
-            }
-
-            val contentLength = (end - start) + 1
-            exchange.responseHeaders.set("Content-Range", "bytes $start-$end/$fileLength")
-            exchange.sendResponseHeaders(206, contentLength)
-
-            RandomAccessFile(file, "r").use { raf ->
-                raf.seek(start)
-                val buffer = ByteArray(64 * 1024)
-                var bytesRemaining = contentLength
-                exchange.responseBody.use { out ->
-                    while (bytesRemaining > 0) {
-                        val toRead = minOf(buffer.size.toLong(), bytesRemaining).toInt()
-                        val read = raf.read(buffer, 0, toRead)
-                        if (read == -1) break
-                        out.write(buffer, 0, read)
-                        bytesRemaining -= read
-                    }
-                }
-            }
-        } else {
-            exchange.sendResponseHeaders(200, fileLength)
-            FileInputStream(file).use { input ->
-                exchange.responseBody.use { out ->
-                    input.copyTo(out)
-                }
+        serviceScope.launch {
+            try {
+                FileLogger.log("warmUpCatalog: building catalog for channelId=$channelId on server start")
+                val items = ChannelCatalogBuilder.getCatalog(channelId, forceRefresh = true)
+                FileLogger.log("warmUpCatalog: done, ${items.size} item(s) ready")
+            } catch (e: Exception) {
+                FileLogger.error("warmUpCatalog failed", e)
             }
         }
-    }
-
-    private fun startForegroundService() {
-        val channelId = "tgserver_stream_channel"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(channelId, "TeleStream Server", NotificationManager.IMPORTANCE_LOW)
-            val manager = getSystemService(NotificationManager::class.java)
-            manager?.createNotificationChannel(channel)
-        }
-
-        val notification: Notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("TeleStream Service Running")
-            .setContentText("Listening on 0.0.0.0:$PORT")
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .build()
-
-        startForeground(1001, notification)
     }
 
     override fun onDestroy() {
+        server?.stop()
+        server = null
         isRunning = false
-        server?.stop(0)
-        executor.shutdown()
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID, "Telegram Stream Server", NotificationManager.IMPORTANCE_LOW
+            )
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun buildNotification(): Notification {
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Telegram Stream Server")
+            .setContentText("Running on port $PORT — keep this running while using CloudStream")
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setOngoing(true)
+            .build()
+    }
 }

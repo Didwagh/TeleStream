@@ -52,11 +52,51 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
         return when (session.uri) {
             "/video" -> serveVideo(session)
             "/catalog" -> serveCatalog(session)
+            "/prefetch" -> servePrefetch(session)
             else -> {
                 FileLogger.log("Unknown route requested: ${session.uri}")
                 newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "not found")
             }
         }
+    }
+
+    /**
+     * GET /prefetch?chat_id=X&message_id=Y
+     * Called from the CloudStream plugin's load() (movie detail screen) to
+     * get a head start before the user actually taps Play. Grabs the first
+     * and last ~2MB in the background - the start for immediate playback,
+     * the end in case this file's MP4 index (moov atom) sits at the end
+     * rather than the start. Always returns immediately; never blocks the
+     * caller, since load() shouldn't be slowed down by this.
+     */
+    private fun servePrefetch(session: IHTTPSession): Response {
+        val chatId = session.parameters["chat_id"]?.firstOrNull()?.toLongOrNull()
+        val messageId = session.parameters["message_id"]?.firstOrNull()?.toLongOrNull()
+        if (chatId == null || messageId == null) {
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "missing chat_id/message_id")
+        }
+
+        serverScope.launch {
+            try {
+                val entry = getOrResolve(chatId, messageId)
+                val prefetchSize = 2L * 1024 * 1024
+                FileLogger.log("Prefetch starting for chatId=$chatId messageId=$messageId (fileSize=${entry.fileSize})")
+
+                entry.bridge.prefetchInBackground(0, minOf(prefetchSize, entry.fileSize))
+
+                if (entry.fileSize > prefetchSize) {
+                    val tailStart = maxOf(0, entry.fileSize - prefetchSize)
+                    entry.bridge.prefetchInBackground(tailStart, entry.fileSize - tailStart)
+                }
+            } catch (e: Exception) {
+                FileLogger.error("Prefetch resolve failed for chatId=$chatId messageId=$messageId", e)
+            }
+        }
+
+        // Ack immediately - the actual downloading happens in the
+        // background via the coroutine launched above, not before this
+        // response is sent.
+        return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\":\"prefetch_started\"}")
     }
 
     private fun serveCatalog(session: IHTTPSession): Response {

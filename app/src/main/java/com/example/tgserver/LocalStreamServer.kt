@@ -6,6 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import java.io.InputStream
+import java.util.concurrent.ConcurrentHashMap
 
 private class ChunkBridgeInputStream(
     private val bridge: ChunkBridge,
@@ -43,8 +44,12 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
 
     private data class Entry(val bridge: ChunkBridge, val fileSize: Long)
 
-    private val cache = HashMap<String, Entry>()
-    private val cacheLock = Any()
+    // ConcurrentHashMap.computeIfAbsent is atomic per-key: if /prefetch and
+    // /video race for the same file (exactly what happens now that /prefetch
+    // fires as soon as the detail screen opens), only one ChunkBridge ever
+    // gets created for it - the second caller gets the same instance instead
+    // of silently creating and orphaning a duplicate.
+    private val cache = ConcurrentHashMap<String, Entry>()
     private val serverScope = CoroutineScope(Dispatchers.IO)
 
     override fun serve(session: IHTTPSession): Response {
@@ -188,14 +193,11 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
 
     private fun getOrResolve(chatId: Long, messageId: Long): Entry {
         val key = "$chatId:$messageId"
-        synchronized(cacheLock) { cache[key]?.let { return it } }
-
-        val file = runBlocking { TelegramFileResolver.resolve(chatId, messageId) }
-        val fileSize = file.size.toLong()
-        val entry = Entry(ChunkBridge(file.id, fileSize), fileSize)
-
-        synchronized(cacheLock) { cache[key] = entry }
-        return entry
+        return cache.computeIfAbsent(key) {
+            val file = runBlocking { TelegramFileResolver.resolve(chatId, messageId) }
+            val fileSize = file.size.toLong()
+            Entry(ChunkBridge(file.id, fileSize), fileSize)
+        }
     }
 
     private fun parseRange(header: String, fileSize: Long): Pair<Long, Long> {

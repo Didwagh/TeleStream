@@ -28,8 +28,8 @@ object TelegramClient {
     val authState = MutableStateFlow<AuthState>(AuthState.Idle)
     private var tdlibParams: TdApi.SetTdlibParameters? = null
 
-    // Tracks the single active file being downloaded/streamed to prevent background data drain
-    @Volatile private var activeDownloadingFileId: Int = 0
+    // Tracks active streams per fileId to pause downloads when the video is closed
+    private val activeStreamCounts = ConcurrentHashMap<Int, Int>()
 
     // Listeners registered per specific fileId
     private val fileIdListeners = ConcurrentHashMap<Int, CopyOnWriteArrayList<(TdApi.File) -> Unit>>()
@@ -208,6 +208,10 @@ object TelegramClient {
         }
     }
 
+    /**
+     * Warmed up for the active file. Automatically stops after 10s if playback doesn't start, 
+     * preventing endless background data drainage.
+     */
     fun warmupFile(chatId: Long, messageId: Long) {
         val c = rawClient()
         c.send(TdApi.GetMessage(chatId, messageId)) { msgRes ->
@@ -218,24 +222,26 @@ object TelegramClient {
                     else -> null
                 }
                 if (file != null && !file.local.isDownloadingCompleted) {
-                    val prevFileId = activeDownloadingFileId
-                    if (prevFileId != 0 && prevFileId != file.id) {
-                        c.send(TdApi.CancelDownloadFile(prevFileId, false)) {}
-                        FileLogger.log("Stopped background download for previous fileId=$prevFileId to save data")
-                    }
-
-                    activeDownloadingFileId = file.id
                     c.send(TdApi.DownloadFile(file.id, 32, 0, 0, false)) {
-                        FileLogger.log("Warmup active for fileId=${file.id} (chatId=$chatId, msgId=$messageId)")
+                        FileLogger.log("Warmup started for fileId=${file.id}")
                     }
+                    
+                    Thread {
+                        Thread.sleep(10_000)
+                        val count = activeStreamCounts[file.id] ?: 0
+                        if (count <= 0) {
+                            c.send(TdApi.CancelDownloadFile(file.id, false)) {}
+                            FileLogger.log("Warmup cancelled for fileId=${file.id} to save data")
+                        }
+                    }.start()
                 }
             }
         }
     }
 
     /**
-     * Streams targeted byte ranges on-demand using TDLib's internal ReadFilePart engine.
-     * This avoids all sparse file OS issues and flawlessly handles MP4 tail probes.
+     * Streams targeted byte ranges on-demand natively using TDLib.
+     * Uses reflection to flawlessly bypass Kotlin package naming collisions.
      */
     suspend fun streamFilePart(
         chatId: Long,
@@ -248,60 +254,76 @@ object TelegramClient {
         val c = rawClient()
         val fileId = tdFile.id
 
-        // Cancel previous background streams to dedicate bandwidth to the active stream
-        if (activeDownloadingFileId != 0 && activeDownloadingFileId != fileId) {
-            c.send(TdApi.CancelDownloadFile(activeDownloadingFileId, false)) {}
-        }
-        activeDownloadingFileId = fileId
+        // Track that a player has opened this socket
+        activeStreamCounts.compute(fileId) { _, current -> (current ?: 0) + 1 }
 
-        // Force TDLib to prioritize downloading from the EXACT requested offset
-        c.send(TdApi.DownloadFile(fileId, 32, startOffset, 0, false)) {}
+        try {
+            // Force TDLib to fetch the exact requested offset immediately (ideal for MP4 tail probes)
+            c.send(TdApi.DownloadFile(fileId, 32, startOffset, 0, false)) {}
 
-        var currentOffset = startOffset
-        var remaining = length
-        val chunkSize = 256 * 1024L // 256 KB chunks
+            var currentOffset = startOffset
+            var remaining = length
+            val chunkSize = 256 * 1024L // 256 KB chunks
 
-        var idleWaitMs = 0
-        while (remaining > 0) {
-            val countToRead = minOf(chunkSize, remaining).toLong()
+            var idleWaitMs = 0
+            while (remaining > 0) {
+                val countToRead = minOf(chunkSize, remaining).toLong()
 
-            // Ask TDLib for the byte chunk. It only returns data if it's actually downloaded.
-            val partData = suspendCancellableCoroutine<ByteArray?> { cont ->
-                c.send(TdApi.ReadFilePart(fileId, currentOffset, countToRead)) { res ->
-                    if (res is TdApi.FilePart && res.data.isNotEmpty()) {
-                        cont.resume(res.data)
-                    } else {
-                        cont.resume(null)
+                // Request the bytes natively through TDLib
+                val partData = suspendCancellableCoroutine<ByteArray?> { cont ->
+                    c.send(TdApi.ReadFilePart(fileId, currentOffset, countToRead)) { res ->
+                        try {
+                            // High-speed reflection to bypass Unresolved Reference compiler issues
+                            if (res != null && res.javaClass.simpleName == "FilePart") {
+                                val data = res.javaClass.getField("data").get(res) as ByteArray
+                                cont.resume(data)
+                            } else {
+                                cont.resume(null)
+                            }
+                        } catch (e: Exception) {
+                            cont.resume(null)
+                        }
+                    }
+                }
+
+                if (partData != null && partData.isNotEmpty()) {
+                    try {
+                        outputStream.write(partData)
+                        outputStream.flush()
+                    } catch (e: Exception) {
+                        // ExoPlayer/VLC closed the socket (seeking or paused)
+                        break
+                    }
+                    
+                    currentOffset += partData.size
+                    remaining -= partData.size
+                    idleWaitMs = 0
+                } else {
+                    // Wait for Telegram servers to send the chunk
+                    kotlinx.coroutines.delay(50)
+                    idleWaitMs += 50
+
+                    // Ping TDLib periodically to keep the download active
+                    if (idleWaitMs % 3000 == 0) {
+                        c.send(TdApi.DownloadFile(fileId, 32, currentOffset, 0, false)) {}
+                    }
+
+                    if (idleWaitMs > 30_000) {
+                        FileLogger.error("Stream timeout at offset $currentOffset after 30s")
+                        break
                     }
                 }
             }
-
-            if (partData != null && partData.isNotEmpty()) {
-                try {
-                    outputStream.write(partData)
-                    outputStream.flush()
-                } catch (e: Exception) {
-                    // ExoPlayer/VLC closed the connection (e.g., they finished reading the header and disconnected)
-                    break
-                }
-                
-                currentOffset += partData.size
-                remaining -= partData.size
-                idleWaitMs = 0
-            } else {
-                // The chunk isn't downloaded yet. Wait 50ms and try again.
-                kotlinx.coroutines.delay(50)
-                idleWaitMs += 50
-
-                // Ping TDLib every 3 seconds to ensure the download from currentOffset hasn't stalled
-                if (idleWaitMs % 3000 == 0) {
-                    c.send(TdApi.DownloadFile(fileId, 32, currentOffset, 0, false)) {}
-                }
-
-                // Total timeout of 30 seconds
-                if (idleWaitMs > 30_000) {
-                    FileLogger.error("Stream idle timeout at offset $currentOffset after 30s")
-                    break
+        } finally {
+            // Player disconnected -> decrement the tracker cleanly
+            activeStreamCounts.compute(fileId) { _, current ->
+                val newCount = (current ?: 1) - 1
+                if (newCount <= 0) {
+                    c.send(TdApi.CancelDownloadFile(fileId, false)) {}
+                    FileLogger.log("Stopped downloading fileId=$fileId to save mobile data")
+                    null 
+                } else {
+                    newCount
                 }
             }
         }

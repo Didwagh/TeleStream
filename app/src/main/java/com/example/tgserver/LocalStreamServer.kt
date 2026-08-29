@@ -33,12 +33,22 @@ private class ChunkBridgeInputStream(
 }
 
 /**
- * GET /video?chat_id=X&message_id=Y  - streams a specific file
- * GET /catalog?channel_id=X          - lists everything in that channel,
- *                                       built live from TDLib, no Render
- *                                       involved at all
- * One process, so this shares the already-logged-in TelegramClient
- * singleton automatically.
+ * GET /video?chat_id=X&message_id=Y   - streams a specific file
+ * GET /catalog?channel_id=X           - lists everything in that channel
+ * GET /search?channel_id=X&query=Y    - filters the cached catalog
+ * GET /warmup?chat_id=X&message_id=Y  - kicks off a low-priority prefetch
+ * GET /prefetch?chat_id=X&message_id=Y - legacy head/tail prefetch
+ *
+ * This is the ONLY HTTP server in the app. It is deliberately built on
+ * NanoHTTPD + ChunkBridge rather than a hand-rolled socket parser, because
+ * ChunkBridge's disk-backed read() (DownloadFile + UpdateFile listener +
+ * RandomAccessFile) is the one download path that has actually been proven
+ * to deliver bytes reliably. Do not replace /video's byte-delivery with
+ * TelegramClient.streamFilePart()'s ReadFilePart-based loop - that path
+ * depends on TDLib's readFilePart returning already-cached bytes, is not
+ * verified against this project's vendored TdApi build, and is the
+ * change that broke streaming. If it's ever revisited, prove it against a
+ * real device first with the old path left intact as a fallback.
  */
 class LocalStreamServer(port: Int) : NanoHTTPD(port) {
 
@@ -57,12 +67,78 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
         return when (session.uri) {
             "/video" -> serveVideo(session)
             "/catalog" -> serveCatalog(session)
+            "/search" -> serveSearch(session)
+            "/warmup" -> serveWarmup(session)
             "/prefetch" -> servePrefetch(session)
             else -> {
                 FileLogger.log("Unknown route requested: ${session.uri}")
                 newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "not found")
             }
         }
+    }
+
+    /**
+     * GET /warmup?chat_id=X&message_id=Y
+     * Called from the CloudStream plugin's load() (movie detail screen) so
+     * TDLib has already started fetching the first bytes of the file by the
+     * time the user taps Play. Delegates to TelegramClient.warmupFile,
+     * which auto-cancels itself after 15s if nothing consumes the file, so
+     * this never leaks a runaway download. Always answers immediately -
+     * the actual downloading happens on TDLib's own thread.
+     */
+    private fun serveWarmup(session: IHTTPSession): Response {
+        val chatId = session.parameters["chat_id"]?.firstOrNull()?.toLongOrNull()
+        val messageId = session.parameters["message_id"]?.firstOrNull()?.toLongOrNull()
+        if (chatId == null || messageId == null) {
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "missing chat_id/message_id")
+        }
+        FileLogger.log("Warmup requested: chatId=$chatId messageId=$messageId")
+        try {
+            TelegramClient.warmupFile(chatId, messageId)
+        } catch (e: Exception) {
+            FileLogger.error("Warmup failed for chatId=$chatId messageId=$messageId", e)
+        }
+        return newFixedLengthResponse(Response.Status.OK, "text/plain", "OK")
+    }
+
+    /**
+     * GET /search?channel_id=X&query=Y
+     * Filters the already-built catalog cache by title or IMDb id. Never
+     * blocks on a rebuild for the same reason /catalog doesn't (see below):
+     * if nothing is cached yet, answers with an empty list and kicks off a
+     * background build so a follow-up call has something to filter.
+     */
+    private fun serveSearch(session: IHTTPSession): Response {
+        val channelId = session.parameters["channel_id"]?.firstOrNull()?.toLongOrNull()
+        if (channelId == null) {
+            FileLogger.error("Search request missing channel_id")
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "missing channel_id")
+        }
+        val query = session.parameters["query"]?.firstOrNull()?.lowercase().orEmpty()
+        FileLogger.log("Search request: channelId=$channelId query=$query")
+
+        val cached = ChannelCatalogBuilder.peekCache(channelId)
+        val items = if (cached != null) {
+            cached
+        } else {
+            if (!ChannelCatalogBuilder.isCurrentlyBuilding()) {
+                FileLogger.log("No cache yet for channelId=$channelId - triggering background build (search)")
+                serverScope.launch {
+                    try {
+                        ChannelCatalogBuilder.getCatalog(channelId, forceRefresh = false)
+                    } catch (e: Exception) {
+                        FileLogger.error("Background catalog build failed (search)", e)
+                    }
+                }
+            }
+            emptyList()
+        }
+
+        val matched = items.filter {
+            it.title.lowercase().contains(query) || (it.imdbId?.lowercase()?.contains(query) == true)
+        }
+        FileLogger.log("Search matched ${matched.size} item(s) for query='$query'")
+        return newFixedLengthResponse(Response.Status.OK, "application/json", ChannelCatalogBuilder.toJson(matched))
     }
 
     /**

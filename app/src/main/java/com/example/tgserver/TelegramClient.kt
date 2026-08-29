@@ -8,6 +8,7 @@ import org.drinkless.tdlib.TdApi
 import java.io.File
 import java.io.OutputStream
 import java.io.RandomAccessFile
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -27,15 +28,38 @@ object TelegramClient {
     val authState = MutableStateFlow<AuthState>(AuthState.Idle)
     private var tdlibParams: TdApi.SetTdlibParameters? = null
 
-    // Listeners used by ChunkBridge.kt for file download progress
-    private val fileListeners = CopyOnWriteArrayList<(TdApi.UpdateFile) -> Unit>()
+    // Listeners registered per specific fileId (used by ChunkBridge.kt)
+    private val fileIdListeners = ConcurrentHashMap<Int, CopyOnWriteArrayList<(TdApi.File) -> Unit>>()
+    private val fileIdUpdateListeners = ConcurrentHashMap<Int, CopyOnWriteArrayList<(TdApi.UpdateFile) -> Unit>>()
+    private val globalFileListeners = CopyOnWriteArrayList<(TdApi.UpdateFile) -> Unit>()
+
+    // Overloads for fileId + listener
+    @JvmName("addFileListenerWithFile")
+    fun addFileListener(fileId: Int, listener: (TdApi.File) -> Unit) {
+        fileIdListeners.getOrPut(fileId) { CopyOnWriteArrayList() }.add(listener)
+    }
+
+    @JvmName("addFileListenerWithUpdate")
+    fun addFileListener(fileId: Int, listener: (TdApi.UpdateFile) -> Unit) {
+        fileIdUpdateListeners.getOrPut(fileId) { CopyOnWriteArrayList() }.add(listener)
+    }
 
     fun addFileListener(listener: (TdApi.UpdateFile) -> Unit) {
-        fileListeners.add(listener)
+        globalFileListeners.add(listener)
+    }
+
+    @JvmName("removeFileListenerWithFile")
+    fun removeFileListener(fileId: Int, listener: (TdApi.File) -> Unit) {
+        fileIdListeners[fileId]?.remove(listener)
+    }
+
+    @JvmName("removeFileListenerWithUpdate")
+    fun removeFileListener(fileId: Int, listener: (TdApi.UpdateFile) -> Unit) {
+        fileIdUpdateListeners[fileId]?.remove(listener)
     }
 
     fun removeFileListener(listener: (TdApi.UpdateFile) -> Unit) {
-        fileListeners.remove(listener)
+        globalFileListeners.remove(listener)
     }
 
     fun rawClient(): Client = client ?: throw IllegalStateException("TelegramClient not initialized")
@@ -58,7 +82,6 @@ object TelegramClient {
             applicationVersion = "1.0"
         }
 
-        // Correct way to set TDLib log verbosity
         try {
             Client.execute(TdApi.SetLogVerbosityLevel(1))
         } catch (ignored: Exception) {}
@@ -69,13 +92,34 @@ object TelegramClient {
     }
 
     private fun handleUpdate(update: TdApi.Object) {
-        // Dispatch file updates to ChunkBridge listeners
         if (update is TdApi.UpdateFile) {
-            fileListeners.forEach { listener ->
+            val file = update.file
+            val fileId = file.id
+
+            // 1. Dispatch to ChunkBridge listeners expecting TdApi.File
+            fileIdListeners[fileId]?.forEach { listener ->
                 try {
-                    listener(update)
+                    listener.invoke(file)
                 } catch (e: Exception) {
-                    FileLogger.error("Error in fileListener", e)
+                    FileLogger.error("Error in fileIdListener for fileId=$fileId", e)
+                }
+            }
+
+            // 2. Dispatch to ChunkBridge listeners expecting TdApi.UpdateFile
+            fileIdUpdateListeners[fileId]?.forEach { listener ->
+                try {
+                    listener.invoke(update)
+                } catch (e: Exception) {
+                    FileLogger.error("Error in fileIdUpdateListener for fileId=$fileId", e)
+                }
+            }
+
+            // 3. Dispatch to global update listeners
+            globalFileListeners.forEach { listener ->
+                try {
+                    listener.invoke(update)
+                } catch (e: Exception) {
+                    FileLogger.error("Error in globalFileListener", e)
                 }
             }
         }

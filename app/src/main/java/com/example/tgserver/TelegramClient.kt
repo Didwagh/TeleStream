@@ -29,6 +29,9 @@ object TelegramClient {
     val authState = MutableStateFlow<AuthState>(AuthState.Idle)
     private var tdlibParams: TdApi.SetTdlibParameters? = null
 
+    // Tracks the single active file being downloaded/streamed to prevent background data drain
+    @Volatile private var activeDownloadingFileId: Int = 0
+
     // Listeners registered per specific fileId (used by ChunkBridge.kt)
     private val fileIdListeners = ConcurrentHashMap<Int, CopyOnWriteArrayList<(TdApi.File) -> Unit>>()
     private val fileIdUpdateListeners = ConcurrentHashMap<Int, CopyOnWriteArrayList<(TdApi.UpdateFile) -> Unit>>()
@@ -207,7 +210,8 @@ object TelegramClient {
     }
 
     /**
-     * Pre-buffers the file in the background as soon as the user opens the movie details page.
+     * Warmed up for the active file. Cancels any old lingering background downloads
+     * so mobile data is not wasted on unplayed files.
      */
     fun warmupFile(chatId: Long, messageId: Long) {
         val c = rawClient()
@@ -219,15 +223,26 @@ object TelegramClient {
                     else -> null
                 }
                 if (file != null && !file.local.isDownloadingCompleted) {
-                    c.send(TdApi.DownloadFile(file.id, 32, 0, 0, false)) {}
-                    FileLogger.log("Warmed up fileId=${file.id} for chatId=$chatId, msgId=$messageId")
+                    // Cancel previous background download if it's a different file
+                    val prevFileId = activeDownloadingFileId
+                    if (prevFileId != 0 && prevFileId != file.id) {
+                        c.send(TdApi.CancelDownloadFile(prevFileId, false)) {}
+                        FileLogger.log("Stopped background download for previous fileId=$prevFileId to save data")
+                    }
+
+                    activeDownloadingFileId = file.id
+                    // Start download from 0 with max priority 32
+                    c.send(TdApi.DownloadFile(file.id, 32, 0, 0, false)) {
+                        FileLogger.log("Warmup active for fileId=${file.id} (chatId=$chatId, msgId=$messageId)")
+                    }
                 }
             }
         }
     }
 
     /**
-     * High-speed, non-blocking stream pipeline.
+     * Streams targeted byte ranges on-demand.
+     * Starts playback immediately as soon as 512 KB is downloaded.
      */
     suspend fun streamFilePart(
         chatId: Long,
@@ -239,15 +254,23 @@ object TelegramClient {
         val (tdFile, _) = getMessageFile(chatId, messageId)
         val c = rawClient()
         val fileId = tdFile.id
+        val totalSize = tdFile.size.toLong()
 
-        // Command TDLib to prioritize downloading from startOffset
+        // 1. Stop background download of any other movie to give 100% bandwidth to this stream
+        if (activeDownloadingFileId != 0 && activeDownloadingFileId != fileId) {
+            c.send(TdApi.CancelDownloadFile(activeDownloadingFileId, false)) {}
+        }
+        activeDownloadingFileId = fileId
+
+        // 2. ALWAYS start from 0 with priority 32 so TDLib assigns the local file path immediately
         if (!tdFile.local.isDownloadingCompleted) {
-            c.send(TdApi.DownloadFile(fileId, 32, startOffset, 0, false)) {}
+            c.send(TdApi.DownloadFile(fileId, 32, 0, 0, false)) {}
         }
 
+        // 3. Resolve the local file path
         var localPath = tdFile.local.path
         var waited = 0
-        while (localPath.isBlank() && waited < 40) {
+        while (localPath.isBlank() && waited < 60) {
             kotlinx.coroutines.delay(100)
             val updated = suspendCancellableCoroutine<TdApi.File> { cont ->
                 c.send(TdApi.GetFile(fileId)) { res ->
@@ -265,12 +288,23 @@ object TelegramClient {
         }
 
         val file = File(localPath)
+
+        // 4. TAIL-PROBE BYPASS: If player asks for the last 2 MB of an unfinished file,
+        // return immediately so ExoPlayer/VLC proceeds directly to streaming from byte 0.
+        if (startOffset > 0 && startOffset >= (totalSize - 3 * 1024 * 1024L)) {
+            val currentDiskLen = file.length()
+            if (currentDiskLen < startOffset && !tdFile.local.isDownloadingCompleted) {
+                FileLogger.log("Tail probe at offset $startOffset bypassed (disk size: $currentDiskLen) for instant start")
+                return
+            }
+        }
+
         var currentOffset = startOffset
         var remaining = length
-        val buffer = ByteArray(256 * 1024) // 256 KB chunks for high throughput
+        val buffer = ByteArray(256 * 1024) // 256 KB chunks
 
         RandomAccessFile(file, "r").use { raf ->
-            var idleCycles = 0
+            var idleWaitMs = 0
             while (remaining > 0) {
                 val fileLength = file.length()
                 if (fileLength > currentOffset) {
@@ -282,23 +316,28 @@ object TelegramClient {
                         outputStream.flush()
                         currentOffset += read
                         remaining -= read
-                        idleCycles = 0
+                        idleWaitMs = 0
                         continue
                     }
                 }
 
-                // If waiting for bytes, yield briefly to avoid locking CPU
-                kotlinx.coroutines.delay(30)
-                idleCycles++
-
-                // Nudge TDLib every 3 seconds if downloading slows down
-                if (idleCycles % 100 == 0 && !tdFile.local.isDownloadingCompleted) {
-                    c.send(TdApi.DownloadFile(fileId, 32, currentOffset, 0, false)) {}
+                // If download finished and we reached EOF, finish cleanly
+                if (tdFile.local.isDownloadingCompleted && fileLength <= currentOffset) {
+                    break
                 }
 
-                // 60-second total timeout before giving up
-                if (idleCycles > 2000) {
-                    FileLogger.error("Stream idle timeout at offset $currentOffset")
+                // Wait 20 ms for next packets from TDLib
+                kotlinx.coroutines.delay(20)
+                idleWaitMs += 20
+
+                // Ping TDLib download if idle for 4 seconds
+                if (idleWaitMs % 4000 == 0 && !tdFile.local.isDownloadingCompleted) {
+                    c.send(TdApi.DownloadFile(fileId, 32, 0, 0, false)) {}
+                }
+
+                // 60-second total timeout
+                if (idleWaitMs > 60_000) {
+                    FileLogger.error("Stream idle timeout at offset $currentOffset after 60s")
                     break
                 }
             }

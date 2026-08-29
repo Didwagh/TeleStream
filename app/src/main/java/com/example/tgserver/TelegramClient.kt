@@ -241,7 +241,7 @@ object TelegramClient {
 
     /**
      * Streams targeted byte ranges on-demand natively using TDLib.
-     * Starts instantly by requesting whatever bytes TDLib has cached immediately.
+     * Uses reflection to bypass Kotlin package naming collisions and length=0 to return chunks instantly.
      */
     suspend fun streamFilePart(
         chatId: Long,
@@ -259,23 +259,27 @@ object TelegramClient {
         activeStreamCounts.compute(fileId) { _, current -> (current ?: 0) + 1 }
 
         try {
-            // Force TDLib to fetch the exact requested offset immediately (ideal for MP4 tail probes)
+            // Force TDLib to fetch the exact requested offset immediately
             c.send(TdApi.DownloadFile(fileId, 32, startOffset, 0, false)) {}
 
             var currentOffset = startOffset
             var remaining = length
-
             var idleWaitMs = 0
+
             while (remaining > 0 && currentOffset < totalSize) {
                 
-                // Request the bytes natively through TDLib. 
-                // Passing '0' as the count tells TDLib to return ANY bytes it has downloaded at this offset.
+                // Passing '0' tells TDLib: "Return ANY bytes currently available at currentOffset immediately"
                 val partData = suspendCancellableCoroutine<ByteArray?> { cont ->
                     c.send(TdApi.ReadFilePart(fileId, currentOffset, 0)) { res ->
-                        // Use fully qualified name to avoid compiler conflict with com.example.tgserver.FilePart
-                        if (res is org.drinkless.tdlib.TdApi.FilePart) {
-                            cont.resume(res.data)
-                        } else {
+                        try {
+                            // Reflection perfectly avoids the "Unresolved reference: FilePart" compiler error
+                            if (res != null && res.javaClass.simpleName == "FilePart") {
+                                val data = res.javaClass.getField("data").get(res) as ByteArray
+                                cont.resume(data)
+                            } else {
+                                cont.resume(null)
+                            }
+                        } catch (e: Exception) {
                             cont.resume(null)
                         }
                     }
@@ -288,7 +292,7 @@ object TelegramClient {
                         outputStream.write(partData, 0, bytesToWrite)
                         outputStream.flush()
                     } catch (e: Exception) {
-                        // ExoPlayer/VLC closed the socket (seeking or paused)
+                        // ExoPlayer/VLC closed the socket
                         break
                     }
                     
@@ -296,11 +300,11 @@ object TelegramClient {
                     remaining -= bytesToWrite
                     idleWaitMs = 0
                 } else {
-                    // Wait for Telegram servers to send the chunk
+                    // Wait briefly for TDLib to fetch the chunk from Telegram servers
                     kotlinx.coroutines.delay(100)
                     idleWaitMs += 100
 
-                    // Ping TDLib periodically to keep the download active
+                    // Ping TDLib periodically to keep the connection prioritized
                     if (idleWaitMs % 2000 == 0) {
                         c.send(TdApi.DownloadFile(fileId, 32, currentOffset, 0, false)) {}
                     }

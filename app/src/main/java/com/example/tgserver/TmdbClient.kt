@@ -19,7 +19,10 @@ object TmdbClient {
     private const val IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
 
     @Volatile private var apiKey: String = ""
-    private val cache = ConcurrentHashMap<String, TmdbMatch?>()
+    
+    // ConcurrentHashMap requires non-null values; use a sentinel object for "no match"
+    private val cache = ConcurrentHashMap<String, TmdbMatch>()
+    private val NOT_FOUND = TmdbMatch(title = "", year = null, imdbId = null, posterUrl = null)
 
     fun init(key: String) {
         apiKey = key.trim()
@@ -29,16 +32,28 @@ object TmdbClient {
 
     fun searchMovie(title: String, year: Int?): TmdbMatch? {
         if (!isConfigured() || title.isBlank()) return null
-        val cacheKey = "movie:${title.lowercase()}:${year ?: ""}"
-        if (cache.containsKey(cacheKey)) return cache[cacheKey]
+        val cacheKey = "movie:${title.lowercase().trim()}:${year ?: ""}"
+        
+        cache[cacheKey]?.let {
+            return if (it === NOT_FOUND) null else it
+        }
 
         val result = runCatching {
-            val yearParam = if (year != null) "&primary_release_year=$year" else ""
+            val yearParam = if (year != null && year > 1900) "&primary_release_year=$year" else ""
             val searchUrl = "$BASE/search/movie?api_key=$apiKey&query=${encode(title)}$yearParam"
-            val results = getJson(searchUrl)?.optJSONArray("results")
-            if (results == null || results.length() == 0) return@runCatching null
+            val json = getJson(searchUrl)
+            val results = json?.optJSONArray("results")
 
-            val best = results.getJSONObject(0)
+            // Fallback: If year-specific search yields nothing, retry with title only
+            val best = if ((results == null || results.length() == 0) && yearParam.isNotEmpty()) {
+                val fallbackUrl = "$BASE/search/movie?api_key=$apiKey&query=${encode(title)}"
+                getJson(fallbackUrl)?.optJSONArray("results")?.optJSONObject(0)
+            } else {
+                results?.optJSONObject(0)
+            }
+
+            if (best == null) return@runCatching null
+
             val tmdbId = best.optInt("id", -1)
             val posterPath = best.optString("poster_path", "")
             val resolvedTitle = best.optString("title", title).ifBlank { title }
@@ -59,21 +74,25 @@ object TmdbClient {
             FileLogger.error("TmdbClient.searchMovie failed for '$title' ($year)", it)
         }.getOrNull()
 
-        cache[cacheKey] = result
+        // Safely cache either the result or the sentinel
+        cache[cacheKey] = result ?: NOT_FOUND
         return result
     }
 
     fun searchTv(title: String): TmdbMatch? {
         if (!isConfigured() || title.isBlank()) return null
-        val cacheKey = "tv:${title.lowercase()}"
-        if (cache.containsKey(cacheKey)) return cache[cacheKey]
+        val cacheKey = "tv:${title.lowercase().trim()}"
+        
+        cache[cacheKey]?.let {
+            return if (it === NOT_FOUND) null else it
+        }
 
         val result = runCatching {
             val searchUrl = "$BASE/search/tv?api_key=$apiKey&query=${encode(title)}"
             val results = getJson(searchUrl)?.optJSONArray("results")
             if (results == null || results.length() == 0) return@runCatching null
 
-            val best = results.getJSONObject(0)
+            val best = results.optJSONObject(0) ?: return@runCatching null
             val tmdbId = best.optInt("id", -1)
             val posterPath = best.optString("poster_path", "")
             val resolvedTitle = best.optString("name", title).ifBlank { title }
@@ -94,7 +113,7 @@ object TmdbClient {
             FileLogger.error("TmdbClient.searchTv failed for '$title'", it)
         }.getOrNull()
 
-        cache[cacheKey] = result
+        cache[cacheKey] = result ?: NOT_FOUND
         return result
     }
 

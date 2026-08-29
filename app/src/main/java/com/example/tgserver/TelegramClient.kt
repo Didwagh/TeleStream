@@ -8,6 +8,7 @@ import org.drinkless.tdlib.TdApi
 import java.io.File
 import java.io.OutputStream
 import java.io.RandomAccessFile
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -25,6 +26,17 @@ object TelegramClient {
     private var client: Client? = null
     val authState = MutableStateFlow<AuthState>(AuthState.Idle)
     private var tdlibParams: TdApi.SetTdlibParameters? = null
+
+    // Listeners used by ChunkBridge.kt for file download progress
+    private val fileListeners = CopyOnWriteArrayList<(TdApi.UpdateFile) -> Unit>()
+
+    fun addFileListener(listener: (TdApi.UpdateFile) -> Unit) {
+        fileListeners.add(listener)
+    }
+
+    fun removeFileListener(listener: (TdApi.UpdateFile) -> Unit) {
+        fileListeners.remove(listener)
+    }
 
     fun rawClient(): Client = client ?: throw IllegalStateException("TelegramClient not initialized")
 
@@ -46,7 +58,10 @@ object TelegramClient {
             applicationVersion = "1.0"
         }
 
-        Client.setLogVerbosityLevel(1)
+        // Correct way to set TDLib log verbosity
+        try {
+            Client.execute(TdApi.SetLogVerbosityLevel(1))
+        } catch (ignored: Exception) {}
 
         client = Client.create({ update ->
             handleUpdate(update)
@@ -54,6 +69,17 @@ object TelegramClient {
     }
 
     private fun handleUpdate(update: TdApi.Object) {
+        // Dispatch file updates to ChunkBridge listeners
+        if (update is TdApi.UpdateFile) {
+            fileListeners.forEach { listener ->
+                try {
+                    listener(update)
+                } catch (e: Exception) {
+                    FileLogger.error("Error in fileListener", e)
+                }
+            }
+        }
+
         when (update) {
             is TdApi.UpdateAuthorizationState -> {
                 when (update.authorizationState) {

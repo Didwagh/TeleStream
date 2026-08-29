@@ -1,8 +1,19 @@
 package com.example.tgserver
 
 /**
- * Parses raw Telegram filenames into clean titles, release years,
- * seasons, episode numbers, and optional episode ranges.
+ * Parses Telegram media filenames into normalized metadata.
+ *
+ * Examples supported:
+ *
+ * House.of.the.Dragon.S03E01
+ * House.of.the.Dragon.S03E01-E04
+ * House of the Dragon S03 [E01-04] COMBINED 1080p
+ * House of the Dragon S03 [E01 - E04] COMBINED
+ * House of the Dragon S03 [E01–E04]
+ * Show 1x01
+ * Show 1x01-04
+ * Show Season 1 Episode 1
+ * Show Season 1 Episode 1-4
  */
 object TitleParser {
 
@@ -14,189 +25,422 @@ object TitleParser {
         val episodeEnd: Int? = null
     ) {
         val isEpisode: Boolean
-            get() = season != null && episode != null
+            get() =
+                season != null &&
+                    episode != null
 
         val isEpisodeRange: Boolean
-            get() = episode != null &&
-                episodeEnd != null &&
-                episodeEnd > episode
+            get() =
+                episode != null &&
+                    episodeEnd != null &&
+                    episodeEnd > episode
     }
 
     // ------------------------------------------------------------
-    // Single-episode formats
+    // IMPORTANT:
+    //
+    // This is the format from your real Telegram file:
+    //
+    // S03 [E01-04]
+    //
+    // The '[' / '(' / '{' between season and episode is optional.
     // ------------------------------------------------------------
 
-    // S01E02, s1.e2, S01 E02, s01e002
-    private val seasonEpisodeA =
-        Regex("""[Ss](\d{1,2})[\s._-]*[Ee](\d{1,3})""")
+    private val seasonEpisodeRangeBracketed =
+        Regex(
+            """\b[Ss](\d{1,2})\s*[\[\(\{]?\s*[Ee](\d{1,3})\s*(?:[-–—]|to|through)\s*(?:[Ee]\s*)?(\d{1,3})"""
+        )
 
-    // 1x02, 01x02 (guarded against resolutions like 1920x1080)
-    private val seasonEpisodeB =
-        Regex("""(?<![0-9])(\d{1,2})x(\d{1,3})(?![0-9])""")
+    // S01E01-E04
+    // S01E01-04
+    // S01E01–E04
+    // S01E01–04
+    // S01E01-S01E04
+    private val seasonEpisodeRangeA =
+        Regex(
+            """\b[Ss](\d{1,2})[\s._-]*[Ee](\d{1,3})\s*(?:[-–—]|to|through)\s*(?:(?:[Ss]\d{1,2}[\s._-]*)?[Ee]\s*)?(\d{1,3})""",
+            RegexOption.IGNORE_CASE
+        )
 
-    // Season 1 Episode 2, Season 01 Ep 2
-    private val seasonEpisodeC = Regex(
-        """Season[\s._-]*(\d{1,2})[^0-9]{0,15}?Ep(?:isode)?[\s._-]*(\d{1,3})""",
-        RegexOption.IGNORE_CASE
-    )
-
-    // ------------------------------------------------------------
-    // Episode-range formats
-    // ------------------------------------------------------------
-
-    // S01E01-E03
-    // S01E01-03
-    // S01E01–E03
-    // S01E01–03
-    // S01E01-S01E03
-    // S01E01 to E03
-    private val seasonEpisodeRangeA = Regex(
-        """[Ss](\d{1,2})[\s._-]*[Ee](\d{1,3})\s*(?:[-–—]|to|through)\s*(?:(?:[Ss]\d{1,2}[\s._-]*)?[Ee]\s*)?(\d{1,3})""",
-        RegexOption.IGNORE_CASE
-    )
-
-    // S01E01E02
+    // S01E01E04
     private val seasonEpisodeRangeAE =
-        Regex("""[Ss](\d{1,2})[\s._-]*[Ee](\d{1,3})[\s._-]*[Ee](\d{1,3})""")
+        Regex(
+            """\b[Ss](\d{1,2})[\s._-]*[Ee](\d{1,3})[\s._-]*[Ee](\d{1,3})""",
+            RegexOption.IGNORE_CASE
+        )
 
-    // 1x01-03
-    // 1x01–03
-    // 1x01 to 03
-    private val seasonEpisodeRangeB = Regex(
-        """(?<![0-9])(\d{1,2})x(\d{1,3})\s*(?:[-–—]|to|through)\s*(\d{1,3})(?![0-9])""",
-        RegexOption.IGNORE_CASE
-    )
+    // 1x01-04
+    // 1x01–04
+    // 1x01 to 04
+    private val seasonEpisodeRangeB =
+        Regex(
+            """\b(\d{1,2})x(\d{1,3})\s*(?:[-–—]|to|through)\s*(\d{1,3})\b""",
+            RegexOption.IGNORE_CASE
+        )
 
-    // Season 1 Episode 1-3
-    private val seasonEpisodeRangeC = Regex(
-        """Season[\s._-]*(\d{1,2})[^0-9]{0,15}?Ep(?:isode)?[\s._-]*(\d{1,3})\s*(?:[-–—]|to|through)\s*(\d{1,3})""",
-        RegexOption.IGNORE_CASE
-    )
+    // Season 1 Episode 1-4
+    private val seasonEpisodeRangeC =
+        Regex(
+            """\bSeason[\s._-]*(\d{1,2})[^0-9]{0,15}?Ep(?:isode)?[\s._-]*(\d{1,3})\s*(?:[-–—]|to|through)\s*(\d{1,3})\b""",
+            RegexOption.IGNORE_CASE
+        )
 
-    // Four-digit year not followed by p/i
-    // to exclude 1080p, 2160p, etc.
+    // ------------------------------------------------------------
+    // Single episode formats
+    // ------------------------------------------------------------
+
+    // S01E02
+    // S1.E2
+    // S01 E02
+    // S01 [E02]
+    private val seasonEpisodeBracketed =
+        Regex(
+            """\b[Ss](\d{1,2})\s*[\[\(\{]?\s*[Ee](\d{1,3})\b"""
+        )
+
+    private val seasonEpisodeA =
+        Regex(
+            """\b[Ss](\d{1,2})[\s._-]*[Ee](\d{1,3})\b"""
+        )
+
+    // 1x02 / 01x02
+    //
+    // Guarded by boundaries so things such as 1920x1080 are not
+    // interpreted as season 19 episode 20.
+    private val seasonEpisodeB =
+        Regex(
+            """\b(\d{1,2})x(\d{1,3})\b""",
+            RegexOption.IGNORE_CASE
+        )
+
+    // Season 1 Episode 2
+    // Season 01 Ep 2
+    private val seasonEpisodeC =
+        Regex(
+            """\bSeason[\s._-]*(\d{1,2})[^0-9]{0,15}?Ep(?:isode)?[\s._-]*(\d{1,3})\b""",
+            RegexOption.IGNORE_CASE
+        )
+
+    // ------------------------------------------------------------
+    // Season-only fallback.
+    //
+    // We intentionally DO NOT classify this as a playable episode,
+    // because without an episode number we cannot truthfully create
+    // a CloudStream EpisodeEntry.
+    // ------------------------------------------------------------
+
+    private val seasonOnlyRegex =
+        Regex(
+            """\b[Ss](\d{1,2})\b"""
+        )
+
+    // ------------------------------------------------------------
+    // Year
+    // ------------------------------------------------------------
+
+    // Matches 1990-2099.
+    //
+    // Avoids:
+    // 1080p
+    // 2160p
+    // etc.
     private val yearRegex =
-        Regex("""(?<![0-9])(19\d{2}|20\d{2})(?![0-9pPiI])""")
+        Regex(
+            """(?<![0-9])(19\d{2}|20\d{2})(?![0-9pPiI])"""
+        )
 
+    // Remove bracketed metadata after the meaningful title.
     private val bracketContent =
-        Regex("""[\[({][^\])}]*[\])}]""")
+        Regex(
+            """[\[({][^\])}]*[\])}]"""
+        )
 
+    // Normalize dots and underscores to spaces.
     private val nonAlnumRun =
-        Regex("""[._]+""")
+        Regex(
+            """[._]+"""
+        )
 
     private val whitespace =
-        Regex("""\s+""")
+        Regex(
+            """\s+"""
+        )
 
-    private val noiseTokens = listOf(
-        "2160p",
-        "1080p",
-        "720p",
-        "480p",
-        "360p",
-        "4k",
-        "uhd",
-        "hdr10",
-        "hdr",
-        "dolby vision",
-        "dv",
-        "x264",
-        "x265",
-        "h264",
-        "h265",
-        "hevc",
-        "avc",
-        "10bit",
-        "8bit",
-        "web-dl",
-        "webdl",
-        "webrip",
-        "web",
-        "bluray",
-        "blu-ray",
-        "brrip",
-        "bdrip",
-        "dvdrip",
-        "dvdscr",
-        "hdrip",
-        "hdtv",
-        "hdcam",
-        "predvd",
-        "proper",
-        "repack",
-        "extended",
-        "uncut",
-        "remastered",
-        "dual audio",
-        "dual",
-        "multi",
-        "aac",
-        "ddp5 1",
-        "dd5 1",
-        "dts",
-        "atmos",
-        "5 1",
-        "7 1",
-        "esubs",
-        "esub",
-        "hindi",
-        "english",
-        "telugu",
-        "tamil",
-        "sub"
-    ).sortedByDescending { it.length }
+    // ------------------------------------------------------------
+    // Release/noise tokens.
+    // These are only applied while constructing the display title.
+    // ------------------------------------------------------------
+
+    private val noiseTokens =
+        listOf(
+            "2160p",
+            "1080p",
+            "720p",
+            "480p",
+            "360p",
+            "4k",
+            "uhd",
+            "hdr10+",
+            "hdr10",
+            "hdr",
+            "dolby vision",
+            "dolby",
+            "vision",
+            "dv",
+            "x264",
+            "x265",
+            "h264",
+            "h265",
+            "hevc",
+            "avc",
+            "10bit",
+            "8bit",
+            "web-dl",
+            "webdl",
+            "webrip",
+            "web",
+            "bluray",
+            "blu-ray",
+            "brrip",
+            "bdrip",
+            "dvdrip",
+            "dvdscr",
+            "hdrip",
+            "hdtv",
+            "hdcam",
+            "predvd",
+            "proper",
+            "repack",
+            "extended",
+            "uncut",
+            "remastered",
+            "combined",
+            "complete",
+            "full",
+            "dual audio",
+            "dual",
+            "multi",
+            "aac",
+            "ddp5 1",
+            "ddp 5 1",
+            "dd5 1",
+            "dd 5 1",
+            "dts",
+            "atmos",
+            "5 1",
+            "7 1",
+            "esubs",
+            "esub",
+            "hindi",
+            "english",
+            "telugu",
+            "tamil",
+            "malayalam",
+            "bengali",
+            "punjabi",
+            "marathi",
+            "kannada",
+            "jhs",
+            "subs",
+            "sub"
+        )
+            .sortedByDescending {
+                it.length
+            }
 
     fun parse(input: String): Parsed {
-        val working = nonAlnumRun.replace(input, " ")
+
+        if (input.isBlank()) {
+            return Parsed(
+                cleanTitle = "",
+                year = null,
+                season = null,
+                episode = null,
+                episodeEnd = null
+            )
+        }
+
+        // Normalize only separators that should behave like spaces.
+        val working =
+            nonAlnumRun.replace(
+                input,
+                " "
+            )
 
         var season: Int? = null
         var episode: Int? = null
         var episodeEnd: Int? = null
-        var cutIndex = working.length
+
+        // This is the point where the title ends.
+        //
+        // For:
+        //
+        // House of the Dragon S03 [E01-04] COMBINED...
+        //
+        // we want cutIndex to point at S03, not E01.
+        var cutIndex =
+            working.length
 
         // --------------------------------------------------------
-        // Highest-priority: explicit episode ranges
+        // 1. Explicit bracketed episode range.
+        //
+        // Handles the user's exact filename:
+        //
+        // S03 [E01-04]
         // --------------------------------------------------------
 
-        seasonEpisodeRangeA.find(working)?.let {
-            season = it.groupValues[1].toIntOrNull()
-            episode = it.groupValues[2].toIntOrNull()
-            episodeEnd = it.groupValues[3].toIntOrNull()
+        seasonEpisodeRangeBracketed
+            .find(working)
+            ?.let { match ->
 
-            cutIndex = minOf(cutIndex, it.range.first)
-        }
+                season =
+                    match.groupValues[1]
+                        .toIntOrNull()
 
-        if (season == null) {
-            seasonEpisodeRangeAE.find(working)?.let {
-                season = it.groupValues[1].toIntOrNull()
-                episode = it.groupValues[2].toIntOrNull()
-                episodeEnd = it.groupValues[3].toIntOrNull()
+                episode =
+                    match.groupValues[2]
+                        .toIntOrNull()
 
-                cutIndex = minOf(cutIndex, it.range.first)
+                episodeEnd =
+                    match.groupValues[3]
+                        .toIntOrNull()
+
+                // IMPORTANT:
+                // Cut before S03.
+                cutIndex =
+                    minOf(
+                        cutIndex,
+                        match.range.first
+                    )
             }
-        }
+
+        // --------------------------------------------------------
+        // 2. Normal S01E01-E04 form
+        // --------------------------------------------------------
 
         if (season == null) {
-            seasonEpisodeRangeB.find(working)?.let {
-                val parsedSeason = it.groupValues[1].toIntOrNull()
 
-                if (parsedSeason != null && parsedSeason in 1..50) {
-                    season = parsedSeason
-                    episode = it.groupValues[2].toIntOrNull()
-                    episodeEnd = it.groupValues[3].toIntOrNull()
+            seasonEpisodeRangeA
+                .find(working)
+                ?.let { match ->
 
-                    cutIndex = minOf(cutIndex, it.range.first)
+                    season =
+                        match.groupValues[1]
+                            .toIntOrNull()
+
+                    episode =
+                        match.groupValues[2]
+                            .toIntOrNull()
+
+                    episodeEnd =
+                        match.groupValues[3]
+                            .toIntOrNull()
+
+                    cutIndex =
+                        minOf(
+                            cutIndex,
+                            match.range.first
+                        )
                 }
-            }
         }
 
-        if (season == null) {
-            seasonEpisodeRangeC.find(working)?.let {
-                season = it.groupValues[1].toIntOrNull()
-                episode = it.groupValues[2].toIntOrNull()
-                episodeEnd = it.groupValues[3].toIntOrNull()
+        // --------------------------------------------------------
+        // 3. S01E01E04
+        // --------------------------------------------------------
 
-                cutIndex = minOf(cutIndex, it.range.first)
-            }
+        if (season == null) {
+
+            seasonEpisodeRangeAE
+                .find(working)
+                ?.let { match ->
+
+                    season =
+                        match.groupValues[1]
+                            .toIntOrNull()
+
+                    episode =
+                        match.groupValues[2]
+                            .toIntOrNull()
+
+                    episodeEnd =
+                        match.groupValues[3]
+                            .toIntOrNull()
+
+                    cutIndex =
+                        minOf(
+                            cutIndex,
+                            match.range.first
+                        )
+                }
+        }
+
+        // --------------------------------------------------------
+        // 4. 1x01-04
+        // --------------------------------------------------------
+
+        if (season == null) {
+
+            seasonEpisodeRangeB
+                .find(working)
+                ?.let { match ->
+
+                    val parsedSeason =
+                        match.groupValues[1]
+                            .toIntOrNull()
+
+                    if (
+                        parsedSeason != null &&
+                        parsedSeason in 1..50
+                    ) {
+
+                        season =
+                            parsedSeason
+
+                        episode =
+                            match.groupValues[2]
+                                .toIntOrNull()
+
+                        episodeEnd =
+                            match.groupValues[3]
+                                .toIntOrNull()
+
+                        cutIndex =
+                            minOf(
+                                cutIndex,
+                                match.range.first
+                            )
+                    }
+                }
+        }
+
+        // --------------------------------------------------------
+        // 5. Season 1 Episode 1-4
+        // --------------------------------------------------------
+
+        if (season == null) {
+
+            seasonEpisodeRangeC
+                .find(working)
+                ?.let { match ->
+
+                    season =
+                        match.groupValues[1]
+                            .toIntOrNull()
+
+                    episode =
+                        match.groupValues[2]
+                            .toIntOrNull()
+
+                    episodeEnd =
+                        match.groupValues[3]
+                            .toIntOrNull()
+
+                    cutIndex =
+                        minOf(
+                            cutIndex,
+                            match.range.first
+                        )
+                }
         }
 
         // --------------------------------------------------------
@@ -204,38 +448,104 @@ object TitleParser {
         // --------------------------------------------------------
 
         if (season == null) {
-            seasonEpisodeA.find(working)?.let {
-                season = it.groupValues[1].toIntOrNull()
-                episode = it.groupValues[2].toIntOrNull()
 
-                cutIndex = minOf(cutIndex, it.range.first)
-            }
-        }
+            seasonEpisodeBracketed
+                .find(working)
+                ?.let { match ->
 
-        if (season == null) {
-            seasonEpisodeB.find(working)?.let {
-                val parsedSeason = it.groupValues[1].toIntOrNull()
+                    season =
+                        match.groupValues[1]
+                            .toIntOrNull()
 
-                if (parsedSeason != null && parsedSeason in 1..50) {
-                    season = parsedSeason
-                    episode = it.groupValues[2].toIntOrNull()
+                    episode =
+                        match.groupValues[2]
+                            .toIntOrNull()
 
-                    cutIndex = minOf(cutIndex, it.range.first)
+                    cutIndex =
+                        minOf(
+                            cutIndex,
+                            match.range.first
+                        )
                 }
-            }
         }
 
         if (season == null) {
-            seasonEpisodeC.find(working)?.let {
-                season = it.groupValues[1].toIntOrNull()
-                episode = it.groupValues[2].toIntOrNull()
 
-                cutIndex = minOf(cutIndex, it.range.first)
-            }
+            seasonEpisodeA
+                .find(working)
+                ?.let { match ->
+
+                    season =
+                        match.groupValues[1]
+                            .toIntOrNull()
+
+                    episode =
+                        match.groupValues[2]
+                            .toIntOrNull()
+
+                    cutIndex =
+                        minOf(
+                            cutIndex,
+                            match.range.first
+                        )
+                }
+        }
+
+        if (season == null) {
+
+            seasonEpisodeB
+                .find(working)
+                ?.let { match ->
+
+                    val parsedSeason =
+                        match.groupValues[1]
+                            .toIntOrNull()
+
+                    if (
+                        parsedSeason != null &&
+                        parsedSeason in 1..50
+                    ) {
+
+                        season =
+                            parsedSeason
+
+                        episode =
+                            match.groupValues[2]
+                                .toIntOrNull()
+
+                        cutIndex =
+                            minOf(
+                                cutIndex,
+                                match.range.first
+                            )
+                    }
+                }
+        }
+
+        if (season == null) {
+
+            seasonEpisodeC
+                .find(working)
+                ?.let { match ->
+
+                    season =
+                        match.groupValues[1]
+                            .toIntOrNull()
+
+                    episode =
+                        match.groupValues[2]
+                            .toIntOrNull()
+
+                    cutIndex =
+                        minOf(
+                            cutIndex,
+                            match.range.first
+                        )
+                }
         }
 
         // --------------------------------------------------------
-        // Validate ranges
+        // Validate the range.
         // --------------------------------------------------------
 
         if (
@@ -247,54 +557,120 @@ object TitleParser {
         }
 
         // --------------------------------------------------------
-        // Year
+        // Year.
+        //
+        // We search the COMPLETE filename, not just the title,
+        // because title cutting happens before release metadata.
         // --------------------------------------------------------
 
-        val yearMatch = yearRegex.find(working)
+        val yearMatch =
+            yearRegex.find(
+                working
+            )
 
         val year =
-            yearMatch?.groupValues?.get(1)?.toIntOrNull()
+            yearMatch
+                ?.groupValues
+                ?.get(1)
+                ?.toIntOrNull()
 
-        yearMatch?.let {
-            cutIndex = minOf(cutIndex, it.range.first)
-        }
+        // Do NOT let the year cut the title when the year occurs
+        // after the title in a normal release filename.
+        //
+        // But if there is a year before the season marker, the
+        // bracket cleanup below will remove it from the display title.
+        //
+        // We therefore intentionally don't alter cutIndex here.
+        //
+        // This is different from the previous parser implementation,
+        // which could accidentally make a year determine the title.
+        // --------------------------------------------------------
 
         // --------------------------------------------------------
-        // Clean title
+        // Clean title.
         // --------------------------------------------------------
 
-        var title = working.substring(0, cutIndex)
+        var title =
+            working
+                .substring(
+                    0,
+                    cutIndex
+                )
 
-        title = bracketContent.replace(title, " ")
-
-        var titleLower = title.lowercase()
-
-        for (token in noiseTokens) {
-            titleLower = titleLower.replace(
-                Regex("""\b${Regex.escape(token)}\b"""),
+        title =
+            bracketContent.replace(
+                title,
                 " "
             )
+
+        var titleLower =
+            title.lowercase()
+
+        for (token in noiseTokens) {
+
+            titleLower =
+                titleLower.replace(
+                    Regex(
+                        """\b${Regex.escape(token)}\b""",
+                        RegexOption.IGNORE_CASE
+                    ),
+                    " "
+                )
         }
 
+        // Remove trailing season markers that can remain in unusual
+        // filenames when no range parser consumed them.
+        titleLower =
+            titleLower.replace(
+                Regex(
+                    """\b[Ss]\d{1,2}\b"""
+                ),
+                " "
+            )
+
         val cleaned =
-            whitespace.replace(titleLower, " ").trim()
+            whitespace
+                .replace(
+                    titleLower,
+                    " "
+                )
+                .trim()
 
         val titleCased =
             cleaned
                 .split(" ")
-                .filter { it.isNotBlank() }
-                .joinToString(" ") { word ->
-                    word.replaceFirstChar { it.uppercase() }
+                .filter {
+                    it.isNotBlank()
+                }
+                .joinToString(" ") {
+                    word ->
+                    word.replaceFirstChar {
+                        it.uppercase()
+                    }
                 }
 
         return Parsed(
-            cleanTitle = titleCased.ifBlank {
-                whitespace.replace(working, " ").trim()
-            },
-            year = year,
-            season = season,
-            episode = episode,
-            episodeEnd = episodeEnd
+            cleanTitle =
+                titleCased.ifBlank {
+                    whitespace
+                        .replace(
+                            working,
+                            " "
+                        )
+                        .trim()
+                },
+
+            year =
+                year,
+
+            season =
+                season,
+
+            episode =
+                episode,
+
+            episodeEnd =
+                episodeEnd
         )
     }
 }

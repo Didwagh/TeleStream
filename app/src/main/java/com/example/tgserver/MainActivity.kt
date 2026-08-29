@@ -24,8 +24,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var prefs: SharedPreferences
     private lateinit var container: LinearLayout
 
-    // The companion app's own server - catalog now comes from here, built
-    // live from TDLib, not from Render anymore.
     private val localBaseUrl = "http://127.0.0.1:${StreamService.PORT}"
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -49,27 +47,15 @@ class MainActivity : AppCompatActivity() {
         val savedApiId = prefs.getInt("api_id", 0)
         val savedApiHash = prefs.getString("api_hash", "") ?: ""
         val savedChannelId = prefs.getLong("channel_id", 0L)
+        val savedTmdbKey = prefs.getString("tmdb_api_key", "") ?: ""
+
+        TmdbClient.init(savedTmdbKey)
 
         if (savedApiId == 0 || savedApiHash.isEmpty() || savedChannelId == 0L) {
             showApiCredentialsForm()
         } else {
             TelegramClient.init(applicationContext, savedApiId, savedApiHash)
             observeAuthState()
-            startWatchdog()
-        }
-    }
-
-    /** If nothing happens at all for 20s (no state change, no exception), surface that as an error too. */
-    private fun startWatchdog() {
-        lifecycleScope.launch {
-            kotlinx.coroutines.delay(20_000)
-            if (TelegramClient.authState.value is AuthState.Idle) {
-                TelegramClient.authState.value = AuthState.Error(
-                    "TDLib never responded after 20 seconds. Tap 'Share Debug Log' below and send " +
-                    "me that file - it now records exactly what TDLib's background thread is doing " +
-                    "internally, which the on-screen message alone can't show."
-                )
-            }
         }
     }
 
@@ -109,11 +95,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun showApiCredentialsForm() {
         clearScreen()
-        addText("Enter your Telegram API credentials", 18f)
-        addText("Get these from my.telegram.org -> API Development Tools. Same values as your Python backend's .env.")
+        addText("Enter Telegram Credentials", 18f)
 
         val idInput = EditText(this).apply {
-            hint = "api_id (numbers only)"
+            hint = "api_id (e.g. 1234567)"
             prefs.getInt("api_id", 0).let { if (it != 0) setText(it.toString()) }
         }
         val hashInput = EditText(this).apply {
@@ -121,30 +106,44 @@ class MainActivity : AppCompatActivity() {
             setText(prefs.getString("api_hash", "") ?: "")
         }
         val channelInput = EditText(this).apply {
-            hint = "channel_id (e.g. -1004374443616)"
+            hint = "channel_id (e.g. -1001234567890)"
             setText(prefs.getLong("channel_id", 0L).let { if (it != 0L) it.toString() else "" })
         }
         container.addView(idInput)
         container.addView(hashInput)
         container.addView(channelInput)
 
+        addText("")
+        addText("TMDB API Key (Optional - for Posters/IMDb IDs)", 15f)
+        val tmdbInput = EditText(this).apply {
+            hint = "tmdb_api_key"
+            setText(prefs.getString("tmdb_api_key", "") ?: "")
+        }
+        container.addView(tmdbInput)
+
         val saveButton = Button(this).apply { text = "Save & Continue" }
         saveButton.setOnClickListener {
             val id = idInput.text.toString().trim().toIntOrNull()
             val hash = hashInput.text.toString().trim()
             val channelId = channelInput.text.toString().trim().toLongOrNull()
+            val tmdbKey = tmdbInput.text.toString().trim()
             if (id == null || hash.isEmpty()) {
-                Toast.makeText(this, "Enter a valid api_id and api_hash", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Enter valid api_id and api_hash", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
             if (channelId == null) {
-                Toast.makeText(this, "Enter a valid channel_id (a negative number)", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Enter valid channel_id (negative integer)", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
-            prefs.edit().putInt("api_id", id).putString("api_hash", hash).putLong("channel_id", channelId).apply()
+            prefs.edit()
+                .putInt("api_id", id)
+                .putString("api_hash", hash)
+                .putLong("channel_id", channelId)
+                .putString("tmdb_api_key", tmdbKey)
+                .apply()
+            TmdbClient.init(tmdbKey)
             TelegramClient.init(applicationContext, id, hash)
             observeAuthState()
-            startWatchdog()
         }
         container.addView(saveButton)
     }
@@ -154,24 +153,21 @@ class MainActivity : AppCompatActivity() {
             TelegramClient.authState.collect { state ->
                 when (state) {
                     is AuthState.Idle -> {
-                        clearScreen(); addText("Starting Telegram client...")
+                        clearScreen(); addText("Starting Telegram Client...")
                     }
-                    is AuthState.WaitPhone -> showLoginInput("Enter your phone number (e.g. +15551234567)") {
+                    is AuthState.WaitPhone -> showLoginInput("Enter phone number (+1234567890)") {
                         TelegramClient.submitPhone(it)
                     }
-                    is AuthState.WaitCode -> showLoginInput("Enter the login code Telegram just sent you") {
+                    is AuthState.WaitCode -> showLoginInput("Enter verification code") {
                         TelegramClient.submitCode(it)
                     }
-                    is AuthState.WaitPassword -> showLoginInput("Enter your 2FA password") {
+                    is AuthState.WaitPassword -> showLoginInput("Enter 2FA password") {
                         TelegramClient.submitPassword(it)
                     }
                     is AuthState.Ready -> showMainScreen()
                     is AuthState.Error -> {
                         clearScreen()
-                        addText("Something went wrong:", 18f)
-                        addText(state.message)
-                        addText("")
-                        addText("If this doesn't make sense, screenshot this screen and send it back.")
+                        addText("Error: ${state.message}", 18f)
                         val retryButton = Button(this@MainActivity).apply { text = "Start Over" }
                         retryButton.setOnClickListener {
                             prefs.edit().clear().apply()
@@ -199,12 +195,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun showMainScreen() {
         clearScreen()
-        addText("Logged in to Telegram", 18f)
-
-        addText(
-            if (StreamService.isRunning) "Server: running on 127.0.0.1:${StreamService.PORT}"
-            else "Server: stopped"
-        )
+        addText("Telegram Status: Connected", 18f)
+        addText("Local Server: ${if (StreamService.isRunning) "Running on port ${StreamService.PORT}" else "Stopped"}")
+        addText("TMDB Enriched: ${if (TmdbClient.isConfigured()) "Enabled" else "Disabled"}")
 
         val toggleButton = Button(this).apply {
             text = if (StreamService.isRunning) "Stop Server" else "Start Server"
@@ -216,41 +209,32 @@ class MainActivity : AppCompatActivity() {
             } else {
                 if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent) else startService(intent)
             }
-            Toast.makeText(this, "Updating...", Toast.LENGTH_SHORT).show()
             container.postDelayed({ showMainScreen() }, 1000)
         }
         container.addView(toggleButton)
 
-        val fetchButton = Button(this).apply { text = "Refresh Catalog (Local)" }
+        val fetchButton = Button(this).apply { text = "Refresh Catalog" }
         fetchButton.setOnClickListener { fetchAndShowCatalog() }
         container.addView(fetchButton)
     }
 
     private fun fetchAndShowCatalog() {
         val channelId = prefs.getLong("channel_id", 0L)
-        if (channelId == 0L) {
-            addText("No channel_id saved - tap 'Start Over' and enter it.")
-            return
-        }
         lifecycleScope.launch {
-            FileLogger.log("Fetch Catalog button tapped, channelId=$channelId")
-            addText("Loading catalog (this rebuilds from Telegram, can take a moment)...")
+            addText("Rebuilding catalog from Telegram & TMDB...")
             val items = try {
                 withContext(Dispatchers.IO) {
                     CatalogRepository.fetchCatalog(localBaseUrl, channelId, forceRefresh = true)
                 }
             } catch (e: Exception) {
-                FileLogger.error("fetchAndShowCatalog failed", e)
-                addText("Failed to load catalog: ${e.message}")
+                addText("Catalog error: ${e.message}")
                 return@launch
             }
-            FileLogger.log("Catalog loaded: ${items.size} item(s)")
             items.forEach { item ->
-                val part = item.parts.firstOrNull() ?: return@forEach
                 val row = TextView(this@MainActivity).apply {
-                    text = "${item.title}  (${part.size / 1024} KB)\n" +
-                        "http://127.0.0.1:${StreamService.PORT}/video?chat_id=${part.chatId}&message_id=${part.messageId}"
-                    setPadding(0, 24, 0, 24)
+                    text = "${item.title} (${item.year ?: "N/A"}) [${item.type.uppercase()}]" +
+                            (item.imdbId?.let { " - IMDb: $it" } ?: "")
+                    setPadding(0, 16, 0, 16)
                 }
                 container.addView(row)
             }

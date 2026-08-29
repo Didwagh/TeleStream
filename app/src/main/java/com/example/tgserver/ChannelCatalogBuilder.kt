@@ -9,67 +9,55 @@ import org.json.JSONObject
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
-data class ChannelPart(
+enum class ItemType { MOVIE, SERIES }
+
+data class FilePart(
     val originalName: String,
     val size: Long,
     val chatId: Long,
-    val messageId: Long
+    val messageId: Long,
+    val label: String
+)
+
+data class EpisodeEntry(
+    val season: Int,
+    val episode: Int,
+    val totalSize: Long,
+    val parts: List<FilePart>
 )
 
 data class ChannelItem(
+    val type: ItemType,
     val title: String,
+    val year: Int?,
+    val imdbId: String?,
+    val posterUrl: String?,
     val totalSize: Long,
-    val parts: List<ChannelPart>
+    val parts: List<FilePart>,
+    val episodes: List<EpisodeEntry>
 )
 
-/**
- * Builds the catalog directly from Telegram using the same already-logged-in
- * TDLib session used for streaming - no separate Pyrogram/Render session
- * involved, so there's no possibility of the two seeing a different view
- * of the channel (which is what caused the earlier 404 on GetMessage).
- *
- * Mirrors the grouping logic your Python backend used: group split files
- * by base filename (stripping .partNNN / .00N / .rNN / .mp4 / .mkv
- * suffixes), sum their sizes, title-case the result.
- */
 object ChannelCatalogBuilder {
 
     private val splitFileSuffix = Regex("""\.(part\d+|00\d+|r\d+|mp4|mkv)$""", RegexOption.IGNORE_CASE)
-    private val whitespace = Regex("""\s+""")
+    private val trailingContainerExt = Regex("""\.(mkv|mp4|avi|mov|ts|webm|m4v)$""", RegexOption.IGNORE_CASE)
 
     private var cache: List<ChannelItem>? = null
     private var cachedChatId: Long? = null
     private val buildLock = Mutex()
     @Volatile private var isBuilding = false
 
-    /**
-     * Returns instantly, NEVER triggers a build, NEVER blocks. This is what
-     * /catalog should call for ordinary requests (i.e. from CloudStream) -
-     * a slow rebuild must never happen inside a request CloudStream's own
-     * HTTP client is waiting on, since that client has its own timeout we
-     * don't control. Returns null if nothing has been built yet for this
-     * chatId.
-     */
     fun peekCache(chatId: Long): List<ChannelItem>? {
         return if (cachedChatId == chatId) cache else null
     }
 
     fun isCurrentlyBuilding(): Boolean = isBuilding
 
-    /**
-     * The actual (slow) build, guarded by a lock so concurrent callers
-     * (e.g. the auto-refresh on server start firing at the same moment as
-     * a manual refresh tap) don't race each other and both hammer TDLib at
-     * once - whoever asks first builds, everyone else just waits for that
-     * same result instead of starting a second redundant build.
-     */
     suspend fun getCatalog(chatId: Long, forceRefresh: Boolean = false): List<ChannelItem> {
         if (!forceRefresh && cachedChatId == chatId && cache != null) {
             return cache!!
         }
         return buildLock.withLock {
-            // Re-check after acquiring the lock - another caller may have
-            // just finished building while we were waiting for the lock.
             if (!forceRefresh && cachedChatId == chatId && cache != null) {
                 return@withLock cache!!
             }
@@ -87,38 +75,62 @@ object ChannelCatalogBuilder {
 
     fun toJson(items: List<ChannelItem>): String {
         val arr = JSONArray()
-        items.forEach { item ->
-            val obj = JSONObject()
-            obj.put("title", item.title)
-            obj.put("total_size", item.totalSize)
-            val partsArr = JSONArray()
-            item.parts.forEach { p ->
-                val partObj = JSONObject()
-                partObj.put("original_name", p.originalName)
-                partObj.put("size", p.size)
-                partObj.put("chat_id", p.chatId)
-                partObj.put("message_id", p.messageId)
-                partsArr.put(partObj)
-            }
-            obj.put("parts", partsArr)
-            arr.put(obj)
-        }
+        items.forEach { item -> arr.put(itemToJson(item)) }
         return arr.toString()
     }
+
+    private fun partToJson(p: FilePart): JSONObject = JSONObject().apply {
+        put("original_name", p.originalName)
+        put("size", p.size)
+        put("chat_id", p.chatId)
+        put("message_id", p.messageId)
+        put("label", p.label)
+    }
+
+    private fun itemToJson(item: ChannelItem): JSONObject = JSONObject().apply {
+        put("type", if (item.type == ItemType.MOVIE) "movie" else "series")
+        put("title", item.title)
+        put("year", item.year ?: JSONObject.NULL)
+        put("imdb_id", item.imdbId ?: JSONObject.NULL)
+        put("poster", item.posterUrl ?: JSONObject.NULL)
+        put("total_size", item.totalSize)
+
+        val partsArr = JSONArray()
+        item.parts.forEach { partsArr.put(partToJson(it)) }
+        put("parts", partsArr)
+
+        val episodesArr = JSONArray()
+        item.episodes.forEach { ep ->
+            val epObj = JSONObject()
+            epObj.put("season", ep.season)
+            epObj.put("episode", ep.episode)
+            epObj.put("total_size", ep.totalSize)
+            val epParts = JSONArray()
+            ep.parts.forEach { epParts.put(partToJson(it)) }
+            epObj.put("parts", epParts)
+            episodesArr.put(epObj)
+        }
+        put("episodes", episodesArr)
+    }
+
+    private data class LeafUnit(
+        val parts: List<FilePart>,
+        val totalSize: Long,
+        val parsed: TitleParser.Parsed
+    )
 
     private suspend fun build(chatId: Long): List<ChannelItem> {
         FileLogger.log("ChannelCatalogBuilder: starting build for chatId=$chatId")
         val client = TelegramClient.rawClient()
 
-        // Ensure TDLib has the chat loaded before requesting its history.
         suspendCancellableCoroutine<Unit> { cont ->
             client.send(TdApi.GetChat(chatId)) { cont.resume(Unit) }
         }
 
-        val grouped = LinkedHashMap<String, MutableList<ChannelPart>>()
+        val grouped = LinkedHashMap<String, MutableList<Triple<String, Long, Long>>>()
         var fromMessageId = 0L
         var fetched = 0
-        val maxMessages = 1000
+        val maxMessages = 1500
 
         while (fetched < maxMessages) {
             val batchSize = minOf(100, maxMessages - fetched)
@@ -130,7 +142,7 @@ object ChannelCatalogBuilder {
             }
 
             val batch = messages.messages?.filterNotNull() ?: emptyList()
-            FileLogger.log("ChannelCatalogBuilder: page fetched ${batch.size} message(s), running total will be ${fetched + batch.size}")
+            FileLogger.log("ChannelCatalogBuilder: fetched batch of ${batch.size} messages")
             if (batch.isEmpty()) break
 
             for (message in batch) {
@@ -140,32 +152,88 @@ object ChannelCatalogBuilder {
                     else -> continue
                 }
 
-                val baseName = whitespace.replace(splitFileSuffix.replace(fileName, ""), "").lowercase()
-                grouped.getOrPut(baseName) { mutableListOf() }.add(
-                    ChannelPart(fileName, fileSize, chatId, message.id)
-                )
+                val baseName = splitFileSuffix.replace(fileName, "")
+                val key = baseName.lowercase()
+                grouped.getOrPut(key) { mutableListOf() }.add(Triple(fileName, fileSize.toLong(), message.id))
             }
 
             fetched += batch.size
             fromMessageId = batch.last().id
-            // NOTE: do NOT stop just because this batch was smaller than
-            // requested - right after login TDLib may not have finished
-            // syncing the chat's full history yet, and a small early batch
-            // does not mean "reached the start of the chat." The only
-            // trustworthy stop signal is a genuinely empty batch (checked
-            // at the top of the loop). Stopping early here was exactly why
-            // a fresh login needed two refreshes to see the full catalog.
         }
 
-        val result = grouped.map { (baseName, parts) ->
-            val sortedParts = parts.sortedBy { it.originalName }
-            ChannelItem(
-                title = baseName.replace('.', ' ').replaceFirstChar { it.uppercase() },
-                totalSize = sortedParts.sumOf { it.size },
-                parts = sortedParts
+        val leaves = grouped.map { (baseKey, fileEntries) ->
+            val sorted = fileEntries.sortedBy { it.first }
+            val multi = sorted.size > 1
+            val parts = sorted.mapIndexed { index, (name, size, msgId) ->
+                FilePart(
+                    originalName = name,
+                    size = size,
+                    chatId = chatId,
+                    messageId = msgId,
+                    label = if (multi) "Part ${index + 1}" else ""
+                )
+            }
+            val titleInput = trailingContainerExt.replace(baseKey, "")
+            val parsed = TitleParser.parse(titleInput)
+            LeafUnit(parts = parts, totalSize = parts.sumOf { it.size }, parsed = parsed)
+        }
+
+        val movieLeaves = leaves.filter { !it.parsed.isEpisode }
+        val episodeLeaves = leaves.filter { it.parsed.isEpisode }
+
+        val seriesGroups = LinkedHashMap<String, MutableList<LeafUnit>>()
+        episodeLeaves.forEach { leaf ->
+            val key = leaf.parsed.cleanTitle.lowercase()
+            seriesGroups.getOrPut(key) { mutableListOf() }.add(leaf)
+        }
+
+        val result = mutableListOf<ChannelItem>()
+
+        for (leaf in movieLeaves) {
+            val parsed = leaf.parsed
+            val match = TmdbClient.searchMovie(parsed.cleanTitle, parsed.year)
+            result.add(
+                ChannelItem(
+                    type = ItemType.MOVIE,
+                    title = match?.title ?: parsed.cleanTitle,
+                    year = match?.year ?: parsed.year,
+                    imdbId = match?.imdbId,
+                    posterUrl = match?.posterUrl,
+                    totalSize = leaf.totalSize,
+                    parts = leaf.parts,
+                    episodes = emptyList()
+                )
             )
         }
-        FileLogger.log("ChannelCatalogBuilder: build complete, ${result.size} item(s) from ${fetched} message(s) scanned")
+
+        for ((_, leavesForSeries) in seriesGroups) {
+            val displayTitle = leavesForSeries.first().parsed.cleanTitle
+            val match = TmdbClient.searchTv(displayTitle)
+            val episodes = leavesForSeries
+                .sortedWith(compareBy({ it.parsed.season }, { it.parsed.episode }))
+                .map { leaf ->
+                    EpisodeEntry(
+                        season = leaf.parsed.season ?: 1,
+                        episode = leaf.parsed.episode ?: 1,
+                        totalSize = leaf.totalSize,
+                        parts = leaf.parts
+                    )
+                }
+            result.add(
+                ChannelItem(
+                    type = ItemType.SERIES,
+                    title = match?.title ?: displayTitle,
+                    year = match?.year,
+                    imdbId = match?.imdbId,
+                    posterUrl = match?.posterUrl,
+                    totalSize = 0L,
+                    parts = emptyList(),
+                    episodes = episodes
+                )
+            )
+        }
+
+        FileLogger.log("ChannelCatalogBuilder: complete. ${movieLeaves.size} movies, ${seriesGroups.size} series.")
         return result
     }
 }

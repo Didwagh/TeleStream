@@ -8,7 +8,6 @@ import org.drinkless.tdlib.Client
 import org.drinkless.tdlib.TdApi
 import java.io.File
 import java.io.OutputStream
-import java.io.RandomAccessFile
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.coroutines.resume
@@ -32,7 +31,7 @@ object TelegramClient {
     // Tracks the single active file being downloaded/streamed to prevent background data drain
     @Volatile private var activeDownloadingFileId: Int = 0
 
-    // Listeners registered per specific fileId (used by ChunkBridge.kt)
+    // Listeners registered per specific fileId
     private val fileIdListeners = ConcurrentHashMap<Int, CopyOnWriteArrayList<(TdApi.File) -> Unit>>()
     private val fileIdUpdateListeners = ConcurrentHashMap<Int, CopyOnWriteArrayList<(TdApi.UpdateFile) -> Unit>>()
     private val globalFileListeners = CopyOnWriteArrayList<(TdApi.UpdateFile) -> Unit>()
@@ -209,10 +208,6 @@ object TelegramClient {
         }
     }
 
-    /**
-     * Warmed up for the active file. Cancels any old lingering background downloads
-     * so mobile data is not wasted on unplayed files.
-     */
     fun warmupFile(chatId: Long, messageId: Long) {
         val c = rawClient()
         c.send(TdApi.GetMessage(chatId, messageId)) { msgRes ->
@@ -223,7 +218,6 @@ object TelegramClient {
                     else -> null
                 }
                 if (file != null && !file.local.isDownloadingCompleted) {
-                    // Cancel previous background download if it's a different file
                     val prevFileId = activeDownloadingFileId
                     if (prevFileId != 0 && prevFileId != file.id) {
                         c.send(TdApi.CancelDownloadFile(prevFileId, false)) {}
@@ -231,7 +225,6 @@ object TelegramClient {
                     }
 
                     activeDownloadingFileId = file.id
-                    // Start download from 0 with max priority 32
                     c.send(TdApi.DownloadFile(file.id, 32, 0, 0, false)) {
                         FileLogger.log("Warmup active for fileId=${file.id} (chatId=$chatId, msgId=$messageId)")
                     }
@@ -241,8 +234,8 @@ object TelegramClient {
     }
 
     /**
-     * Streams targeted byte ranges on-demand.
-     * Starts playback immediately as soon as 512 KB is downloaded.
+     * Streams targeted byte ranges on-demand using TDLib's internal ReadFilePart engine.
+     * This avoids all sparse file OS issues and flawlessly handles MP4 tail probes.
      */
     suspend fun streamFilePart(
         chatId: Long,
@@ -254,90 +247,60 @@ object TelegramClient {
         val (tdFile, _) = getMessageFile(chatId, messageId)
         val c = rawClient()
         val fileId = tdFile.id
-        val totalSize = tdFile.size.toLong()
 
-        // 1. Stop background download of any other movie to give 100% bandwidth to this stream
+        // Cancel previous background streams to dedicate bandwidth to the active stream
         if (activeDownloadingFileId != 0 && activeDownloadingFileId != fileId) {
             c.send(TdApi.CancelDownloadFile(activeDownloadingFileId, false)) {}
         }
         activeDownloadingFileId = fileId
 
-        // 2. ALWAYS start from 0 with priority 32 so TDLib assigns the local file path immediately
-        if (!tdFile.local.isDownloadingCompleted) {
-            c.send(TdApi.DownloadFile(fileId, 32, 0, 0, false)) {}
-        }
-
-        // 3. Resolve the local file path
-        var localPath = tdFile.local.path
-        var waited = 0
-        while (localPath.isBlank() && waited < 60) {
-            kotlinx.coroutines.delay(100)
-            val updated = suspendCancellableCoroutine<TdApi.File> { cont ->
-                c.send(TdApi.GetFile(fileId)) { res ->
-                    if (res is TdApi.File) cont.resume(res)
-                    else cont.resume(tdFile)
-                }
-            }
-            localPath = updated.local.path
-            waited++
-        }
-
-        if (localPath.isBlank()) {
-            FileLogger.error("Failed to allocate local path for fileId=$fileId")
-            return
-        }
-
-        val file = File(localPath)
-
-        // 4. TAIL-PROBE BYPASS: If player asks for the last 2 MB of an unfinished file,
-        // return immediately so ExoPlayer/VLC proceeds directly to streaming from byte 0.
-        if (startOffset > 0 && startOffset >= (totalSize - 3 * 1024 * 1024L)) {
-            val currentDiskLen = file.length()
-            if (currentDiskLen < startOffset && !tdFile.local.isDownloadingCompleted) {
-                FileLogger.log("Tail probe at offset $startOffset bypassed (disk size: $currentDiskLen) for instant start")
-                return
-            }
-        }
+        // Force TDLib to prioritize downloading from the EXACT requested offset
+        c.send(TdApi.DownloadFile(fileId, 32, startOffset, 0, false)) {}
 
         var currentOffset = startOffset
         var remaining = length
-        val buffer = ByteArray(256 * 1024) // 256 KB chunks
+        val chunkSize = 256 * 1024L // 256 KB chunks
 
-        RandomAccessFile(file, "r").use { raf ->
-            var idleWaitMs = 0
-            while (remaining > 0) {
-                val fileLength = file.length()
-                if (fileLength > currentOffset) {
-                    raf.seek(currentOffset)
-                    val toRead = minOf(buffer.size.toLong(), remaining, fileLength - currentOffset).toInt()
-                    val read = raf.read(buffer, 0, toRead)
-                    if (read > 0) {
-                        outputStream.write(buffer, 0, read)
-                        outputStream.flush()
-                        currentOffset += read
-                        remaining -= read
-                        idleWaitMs = 0
-                        continue
+        var idleWaitMs = 0
+        while (remaining > 0) {
+            val countToRead = minOf(chunkSize, remaining).toLong()
+
+            // Ask TDLib for the byte chunk. It only returns data if it's actually downloaded.
+            val partData = suspendCancellableCoroutine<ByteArray?> { cont ->
+                c.send(TdApi.ReadFilePart(fileId, currentOffset, countToRead)) { res ->
+                    if (res is TdApi.FilePart && res.data.isNotEmpty()) {
+                        cont.resume(res.data)
+                    } else {
+                        cont.resume(null)
                     }
                 }
+            }
 
-                // If download finished and we reached EOF, finish cleanly
-                if (tdFile.local.isDownloadingCompleted && fileLength <= currentOffset) {
+            if (partData != null && partData.isNotEmpty()) {
+                try {
+                    outputStream.write(partData)
+                    outputStream.flush()
+                } catch (e: Exception) {
+                    // ExoPlayer/VLC closed the connection (e.g., they finished reading the header and disconnected)
                     break
                 }
+                
+                currentOffset += partData.size
+                remaining -= partData.size
+                idleWaitMs = 0
+            } else {
+                // The chunk isn't downloaded yet. Wait 50ms and try again.
+                kotlinx.coroutines.delay(50)
+                idleWaitMs += 50
 
-                // Wait 20 ms for next packets from TDLib
-                kotlinx.coroutines.delay(20)
-                idleWaitMs += 20
-
-                // Ping TDLib download if idle for 4 seconds
-                if (idleWaitMs % 4000 == 0 && !tdFile.local.isDownloadingCompleted) {
-                    c.send(TdApi.DownloadFile(fileId, 32, 0, 0, false)) {}
+                // Ping TDLib every 3 seconds to ensure the download from currentOffset hasn't stalled
+                if (idleWaitMs % 3000 == 0) {
+                    c.send(TdApi.DownloadFile(fileId, 32, currentOffset, 0, false)) {}
                 }
 
-                // 60-second total timeout
-                if (idleWaitMs > 60_000) {
-                    FileLogger.error("Stream idle timeout at offset $currentOffset after 60s")
+                // Total timeout of 30 seconds
+                if (idleWaitMs > 30_000) {
+                    FileLogger.error("Stream idle timeout at offset $currentOffset after 30s")
                     break
                 }
             }

@@ -8,7 +8,6 @@ import org.drinkless.tdlib.Client
 import org.drinkless.tdlib.TdApi
 import java.io.File
 import java.io.OutputStream
-import java.io.RandomAccessFile
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.coroutines.resume
@@ -206,6 +205,10 @@ object TelegramClient {
         }
     }
 
+    /**
+     * Streams targeted byte ranges on-demand using TDLib chunks.
+     * Starts playback immediately without waiting for the full file to download.
+     */
     suspend fun streamFilePart(
         chatId: Long,
         messageId: Long,
@@ -215,48 +218,51 @@ object TelegramClient {
     ) {
         val (tdFile, _) = getMessageFile(chatId, messageId)
         val c = rawClient()
+        val fileId = tdFile.id
 
-        if (!tdFile.local.isDownloadingCompleted) {
-            suspendCancellableCoroutine<Unit> { cont ->
-                c.send(TdApi.DownloadFile(tdFile.id, 32, 0, 0, true)) { res ->
-                    cont.resume(Unit)
+        var currentOffset = startOffset
+        var remaining = length
+        val CHUNK_SIZE = 512 * 1024L // 512 KB per requested chunk
+
+        while (remaining > 0) {
+            val countToRead = minOf(CHUNK_SIZE, remaining)
+
+            // 1. Tell Telegram to download this specific chunk with highest priority (32)
+            c.send(TdApi.DownloadFile(fileId, 32, currentOffset, countToRead, false)) {}
+
+            // 2. Read the downloaded chunk
+            var partData: ByteArray? = null
+            var attempts = 0
+
+            while (partData == null && attempts < 80) { // Up to 8 seconds wait per 512 KB slice
+                partData = suspendCancellableCoroutine { cont ->
+                    c.send(TdApi.ReadFilePart(fileId, currentOffset, countToRead)) { res ->
+                        if (res is TdApi.FilePart && res.data.isNotEmpty()) {
+                            cont.resume(res.data)
+                        } else {
+                            cont.resume(null)
+                        }
+                    }
+                }
+
+                if (partData == null) {
+                    attempts++
+                    if (attempts % 10 == 0) {
+                        c.send(TdApi.DownloadFile(fileId, 32, currentOffset, countToRead, false)) {}
+                    }
+                    kotlinx.coroutines.delay(100)
                 }
             }
-        }
 
-        var localPath = tdFile.local.path
-        var waited = 0
-        while (localPath.isBlank() && waited < 10) {
-            kotlinx.coroutines.delay(500)
-            val updated = suspendCancellableCoroutine<TdApi.File> { cont ->
-                c.send(TdApi.GetFile(tdFile.id)) { res ->
-                    if (res is TdApi.File) cont.resume(res)
-                    else cont.resume(tdFile)
-                }
-            }
-            localPath = updated.local.path
-            waited++
-        }
-
-        val file = File(localPath)
-        if (!file.exists()) {
-            throw IllegalStateException("File download not started yet or local path empty")
-        }
-
-        RandomAccessFile(file, "r").use { raf ->
-            raf.seek(startOffset)
-            val buffer = ByteArray(64 * 1024)
-            var remaining = length
-            while (remaining > 0) {
-                val toRead = minOf(buffer.size.toLong(), remaining).toInt()
-                val read = raf.read(buffer, 0, toRead)
-                if (read == -1) {
-                    kotlinx.coroutines.delay(200)
-                    continue
-                }
-                outputStream.write(buffer, 0, read)
+            if (partData != null) {
+                outputStream.write(partData)
                 outputStream.flush()
-                remaining -= read
+                val bytesWritten = partData.size.toLong()
+                currentOffset += bytesWritten
+                remaining -= bytesWritten
+            } else {
+                FileLogger.error("Stream timeout at offset $currentOffset")
+                break
             }
         }
     }

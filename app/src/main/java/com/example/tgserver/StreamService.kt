@@ -8,12 +8,14 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import java.io.BufferedReader
+import java.io.IOException
 import java.io.InputStreamReader
 import java.io.OutputStream
 import java.net.ServerSocket
@@ -62,13 +64,20 @@ class StreamService : Service() {
                 serverSocket = ServerSocket(PORT)
                 FileLogger.log("StreamService: HTTP Server listening on port $PORT")
                 while (isRunning) {
-                    val clientSocket = serverSocket?.accept() ?: break
-                    serviceScope.launch {
+                    val clientSocket = try {
+                        serverSocket?.accept() ?: break
+                    } catch (e: Exception) {
+                        if (!isRunning) break
+                        continue
+                    }
+                    serviceScope.launch(Dispatchers.IO) {
                         handleClient(clientSocket)
                     }
                 }
             } catch (e: Exception) {
-                FileLogger.error("StreamService server exception", e)
+                if (isRunning) {
+                    FileLogger.error("StreamService server exception", e)
+                }
             }
         }
     }
@@ -174,7 +183,13 @@ class StreamService : Service() {
             }
 
             val length = (end - start) + 1
-            val mime = if (fileName.endsWith(".mkv")) "video/x-matroska" else "video/mp4"
+            val mime = when {
+                fileName.endsWith(".mkv", ignoreCase = true) -> "video/x-matroska"
+                fileName.endsWith(".mp4", ignoreCase = true) -> "video/mp4"
+                fileName.endsWith(".webm", ignoreCase = true) -> "video/webm"
+                fileName.endsWith(".avi", ignoreCase = true) -> "video/x-msvideo"
+                else -> "video/mp4"
+            }
 
             val headerStr = "HTTP/1.1 206 Partial Content\r\n" +
                     "Content-Type: $mime\r\n" +
@@ -188,7 +203,10 @@ class StreamService : Service() {
 
             TelegramClient.streamFilePart(chatId, messageId, start, length, out)
         } catch (e: Exception) {
-            FileLogger.error("handleVideo stream error", e)
+            // Player disconnects and seeking are normal during video playback
+            if (e !is CancellationException && e !is IOException) {
+                FileLogger.error("handleVideo stream error", e)
+            }
         }
     }
 

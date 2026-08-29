@@ -109,6 +109,7 @@ class StreamService : Service() {
             when (uriPath) {
                 "/catalog" -> handleCatalog(queryParams, out)
                 "/search" -> handleSearch(queryParams, out)
+                "/warmup" -> handleWarmup(queryParams, out)
                 "/video" -> handleVideo(queryParams, headers, out)
                 else -> {
                     val notFound = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
@@ -116,6 +117,15 @@ class StreamService : Service() {
                 }
             }
         }
+    }
+
+    private fun handleWarmup(params: Map<String, String>, out: OutputStream) {
+        val chatId = params["chat_id"]?.toLongOrNull() ?: return
+        val messageId = params["message_id"]?.toLongOrNull() ?: return
+        TelegramClient.warmupFile(chatId, messageId)
+        val resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+        out.write(resp.toByteArray())
+        out.flush()
     }
 
     private suspend fun handleCatalog(params: Map<String, String>, out: OutputStream) {
@@ -203,7 +213,6 @@ class StreamService : Service() {
 
             TelegramClient.streamFilePart(chatId, messageId, start, length, out)
         } catch (e: Exception) {
-            // Player disconnects and seeking are normal during video playback
             if (e !is CancellationException && e !is IOException) {
                 FileLogger.error("handleVideo stream error", e)
             }

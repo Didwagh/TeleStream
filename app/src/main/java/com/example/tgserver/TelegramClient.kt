@@ -1,6 +1,7 @@
 package com.example.tgserver
 
 import android.content.Context
+import android.os.Build
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
 import org.drinkless.tdlib.Client
@@ -33,7 +34,6 @@ object TelegramClient {
     private val fileIdUpdateListeners = ConcurrentHashMap<Int, CopyOnWriteArrayList<(TdApi.UpdateFile) -> Unit>>()
     private val globalFileListeners = CopyOnWriteArrayList<(TdApi.UpdateFile) -> Unit>()
 
-    // Overloads for fileId + listener
     @JvmName("addFileListenerWithFile")
     fun addFileListener(fileId: Int, listener: (TdApi.File) -> Unit) {
         fileIdListeners.getOrPut(fileId) { CopyOnWriteArrayList() }.add(listener)
@@ -67,28 +67,49 @@ object TelegramClient {
     fun init(context: Context, apiId: Int, apiHash: String) {
         if (client != null) return
 
+        // 1. Explicitly load native JNI library safely
+        try {
+            System.loadLibrary("tdjni")
+            FileLogger.log("Successfully loaded libtdjni.so")
+        } catch (t: Throwable) {
+            FileLogger.error("Failed to load libtdjni.so", t)
+        }
+
         val dbDir = File(context.filesDir, "tdlib").apply { mkdirs() }.absolutePath
         val filesDir = File(context.cacheDir, "tdlib_files").apply { mkdirs() }.absolutePath
 
+        // 2. Fully populate ALL required string and boolean fields to prevent native SIGSEGV
         tdlibParams = TdApi.SetTdlibParameters().apply {
-            databaseDirectory = dbDir
-            filesDirectory = filesDir
-            useMessageDatabase = true
-            useSecretChats = false
+            this.databaseDirectory = dbDir
+            this.filesDirectory = filesDir
+            this.useMessageDatabase = true
+            this.useSecretChats = false
+            this.useFileDatabase = true
+            this.useChatInfoDatabase = true
             this.apiId = apiId
             this.apiHash = apiHash
-            systemLanguageCode = "en"
-            deviceModel = "Android"
-            applicationVersion = "1.0"
+            this.systemLanguageCode = "en"
+            this.deviceModel = if (Build.MODEL.isNullOrBlank()) "Android" else Build.MODEL
+            this.systemVersion = if (Build.VERSION.RELEASE.isNullOrBlank()) "10.0" else Build.VERSION.RELEASE
+            this.applicationVersion = "1.0"
+            this.enableStorageOptimizer = true
+            this.ignoreFileNames = false
         }
 
         try {
             Client.execute(TdApi.SetLogVerbosityLevel(1))
-        } catch (ignored: Exception) {}
+        } catch (e: Throwable) {
+            FileLogger.error("SetLogVerbosityLevel error", e)
+        }
 
+        // 3. Create TDLib client with full error handlers
         client = Client.create({ update ->
             handleUpdate(update)
-        }, null, null)
+        }, { updateError ->
+            FileLogger.error("TDLib update error: ${updateError?.message}")
+        }, { defaultError ->
+            FileLogger.error("TDLib default exception: ${defaultError?.message}")
+        })
     }
 
     private fun handleUpdate(update: TdApi.Object) {
@@ -96,39 +117,37 @@ object TelegramClient {
             val file = update.file
             val fileId = file.id
 
-            // 1. Dispatch to ChunkBridge listeners expecting TdApi.File
             fileIdListeners[fileId]?.forEach { listener ->
-                try {
-                    listener.invoke(file)
-                } catch (e: Exception) {
-                    FileLogger.error("Error in fileIdListener for fileId=$fileId", e)
-                }
+                try { listener.invoke(file) } catch (e: Exception) { FileLogger.error("Error in fileIdListener", e) }
             }
-
-            // 2. Dispatch to ChunkBridge listeners expecting TdApi.UpdateFile
             fileIdUpdateListeners[fileId]?.forEach { listener ->
-                try {
-                    listener.invoke(update)
-                } catch (e: Exception) {
-                    FileLogger.error("Error in fileIdUpdateListener for fileId=$fileId", e)
-                }
+                try { listener.invoke(update) } catch (e: Exception) { FileLogger.error("Error in fileIdUpdateListener", e) }
             }
-
-            // 3. Dispatch to global update listeners
             globalFileListeners.forEach { listener ->
-                try {
-                    listener.invoke(update)
-                } catch (e: Exception) {
-                    FileLogger.error("Error in globalFileListener", e)
-                }
+                try { listener.invoke(update) } catch (e: Exception) { FileLogger.error("Error in globalFileListener", e) }
             }
         }
 
         when (update) {
             is TdApi.UpdateAuthorizationState -> {
-                when (update.authorizationState) {
+                when (val auth = update.authorizationState) {
                     is TdApi.AuthorizationStateWaitTdlibParameters -> {
-                        tdlibParams?.let { client?.send(it, {}) }
+                        tdlibParams?.let { params ->
+                            sendSafe(params) { res ->
+                                if (res is TdApi.Error) {
+                                    FileLogger.error("SetTdlibParameters error: ${res.message}")
+                                    authState.value = AuthState.Error(res.message)
+                                }
+                            }
+                        }
+                    }
+                    is TdApi.AuthorizationStateWaitEncryptionKey -> {
+                        sendSafe(TdApi.CheckDatabaseEncryptionKey()) { res ->
+                            if (res is TdApi.Error) {
+                                FileLogger.error("CheckDatabaseEncryptionKey error: ${res.message}")
+                                authState.value = AuthState.Error(res.message)
+                            }
+                        }
                     }
                     is TdApi.AuthorizationStateWaitPhoneNumber -> {
                         authState.value = AuthState.WaitPhone
@@ -152,20 +171,36 @@ object TelegramClient {
         }
     }
 
+    private fun sendSafe(query: TdApi.Function, handler: Client.ResultHandler) {
+        val c = client
+        if (c != null) {
+            c.send(query, handler)
+        } else {
+            Thread {
+                var retries = 0
+                while (client == null && retries < 20) {
+                    Thread.sleep(50)
+                    retries++
+                }
+                client?.send(query, handler)
+            }.start()
+        }
+    }
+
     fun submitPhone(phone: String) {
-        client?.send(TdApi.SetAuthenticationPhoneNumber(phone, null)) { res ->
+        sendSafe(TdApi.SetAuthenticationPhoneNumber(phone, null)) { res ->
             if (res is TdApi.Error) authState.value = AuthState.Error(res.message)
         }
     }
 
     fun submitCode(code: String) {
-        client?.send(TdApi.CheckAuthenticationCode(code)) { res ->
+        sendSafe(TdApi.CheckAuthenticationCode(code)) { res ->
             if (res is TdApi.Error) authState.value = AuthState.Error(res.message)
         }
     }
 
     fun submitPassword(password: String) {
-        client?.send(TdApi.CheckAuthenticationPassword(password)) { res ->
+        sendSafe(TdApi.CheckAuthenticationPassword(password)) { res ->
             if (res is TdApi.Error) authState.value = AuthState.Error(res.message)
         }
     }

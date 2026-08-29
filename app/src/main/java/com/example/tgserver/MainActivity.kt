@@ -16,6 +16,8 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.FileProvider
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -23,6 +25,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var prefs: SharedPreferences
     private lateinit var container: LinearLayout
+    private var authObserverJob: Job? = null
 
     private val localBaseUrl = "http://127.0.0.1:${StreamService.PORT}"
 
@@ -54,8 +57,25 @@ class MainActivity : AppCompatActivity() {
         if (savedApiId == 0 || savedApiHash.isEmpty() || savedChannelId == 0L) {
             showApiCredentialsForm()
         } else {
-            TelegramClient.init(applicationContext, savedApiId, savedApiHash)
-            observeAuthState()
+            try {
+                TelegramClient.init(applicationContext, savedApiId, savedApiHash)
+                observeAuthState()
+                startWatchdog()
+            } catch (t: Throwable) {
+                FileLogger.error("Error during startup init", t)
+                showApiCredentialsForm()
+            }
+        }
+    }
+
+    private fun startWatchdog() {
+        lifecycleScope.launch {
+            delay(20_000)
+            if (TelegramClient.authState.value is AuthState.Idle) {
+                TelegramClient.authState.value = AuthState.Error(
+                    "TDLib did not respond within 20 seconds. Check your internet connection and API credentials."
+                )
+            }
         }
     }
 
@@ -114,9 +134,9 @@ class MainActivity : AppCompatActivity() {
         container.addView(channelInput)
 
         addText("")
-        addText("TMDB API Key (Optional - for Posters/IMDb IDs)", 15f)
+        addText("TMDB API Key (Optional - 32 character key)", 15f)
         val tmdbInput = EditText(this).apply {
-            hint = "tmdb_api_key"
+            hint = "tmdb_api_key (v3 auth)"
             setText(prefs.getString("tmdb_api_key", "") ?: "")
         }
         container.addView(tmdbInput)
@@ -127,6 +147,7 @@ class MainActivity : AppCompatActivity() {
             val hash = hashInput.text.toString().trim()
             val channelId = channelInput.text.toString().trim().toLongOrNull()
             val tmdbKey = tmdbInput.text.toString().trim()
+
             if (id == null || hash.isEmpty()) {
                 Toast.makeText(this, "Enter valid api_id and api_hash", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
@@ -135,21 +156,30 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Enter valid channel_id (negative integer)", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
-            prefs.edit()
-                .putInt("api_id", id)
-                .putString("api_hash", hash)
-                .putLong("channel_id", channelId)
-                .putString("tmdb_api_key", tmdbKey)
-                .apply()
-            TmdbClient.init(tmdbKey)
-            TelegramClient.init(applicationContext, id, hash)
-            observeAuthState()
+
+            try {
+                prefs.edit()
+                    .putInt("api_id", id)
+                    .putString("api_hash", hash)
+                    .putLong("channel_id", channelId)
+                    .putString("tmdb_api_key", tmdbKey)
+                    .apply()
+
+                TmdbClient.init(tmdbKey)
+                TelegramClient.init(applicationContext, id, hash)
+                observeAuthState()
+                startWatchdog()
+            } catch (t: Throwable) {
+                FileLogger.error("Failed to save credentials and start client", t)
+                Toast.makeText(this, "Startup error: ${t.message}", Toast.LENGTH_LONG).show()
+            }
         }
         container.addView(saveButton)
     }
 
     private fun observeAuthState() {
-        lifecycleScope.launch {
+        authObserverJob?.cancel()
+        authObserverJob = lifecycleScope.launch {
             TelegramClient.authState.collect { state ->
                 when (state) {
                     is AuthState.Idle -> {

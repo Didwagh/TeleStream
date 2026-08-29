@@ -18,6 +18,13 @@ object FileLogger {
         val dir = context.getExternalFilesDir(null) ?: context.filesDir
         logFile = File(dir, "telestream_debug.log")
         log("=== Logger initialized ===")
+
+        // Catch and log every unhandled crash automatically
+        val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            error("FATAL UNCAUGHT EXCEPTION on thread [${thread.name}]", throwable)
+            defaultHandler?.uncaughtException(thread, throwable)
+        }
     }
 
     fun getLogFile(): File? = logFile

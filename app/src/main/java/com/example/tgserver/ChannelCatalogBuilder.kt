@@ -34,7 +34,12 @@ data class ChannelItem(
     val posterUrl: String?,
     val totalSize: Long,
     val parts: List<FilePart>,
-    val episodes: List<EpisodeEntry>
+    val episodes: List<EpisodeEntry>,
+    val overview: String? = null,
+    val rating: Double? = null,
+    val runtimeMinutes: Int? = null,
+    val genres: List<String> = emptyList(),
+    val cast: List<String> = emptyList()
 )
 
 object ChannelCatalogBuilder {
@@ -94,6 +99,17 @@ object ChannelCatalogBuilder {
         put("imdb_id", item.imdbId ?: JSONObject.NULL)
         put("poster", item.posterUrl ?: JSONObject.NULL)
         put("total_size", item.totalSize)
+        put("overview", item.overview ?: JSONObject.NULL)
+        put("rating", item.rating ?: JSONObject.NULL)
+        put("runtime_minutes", item.runtimeMinutes ?: JSONObject.NULL)
+
+        val genresArr = JSONArray()
+        item.genres.forEach { genresArr.put(it) }
+        put("genres", genresArr)
+
+        val castArr = JSONArray()
+        item.cast.forEach { castArr.put(it) }
+        put("cast", castArr)
 
         val partsArr = JSONArray()
         item.parts.forEach { partsArr.put(partToJson(it)) }
@@ -201,7 +217,12 @@ object ChannelCatalogBuilder {
                     posterUrl = match?.posterUrl,
                     totalSize = leaf.totalSize,
                     parts = leaf.parts,
-                    episodes = emptyList()
+                    episodes = emptyList(),
+                    overview = match?.overview,
+                    rating = match?.rating,
+                    runtimeMinutes = match?.runtimeMinutes,
+                    genres = match?.genres ?: emptyList(),
+                    cast = match?.cast ?: emptyList()
                 )
             )
         }
@@ -228,7 +249,12 @@ object ChannelCatalogBuilder {
                     posterUrl = match?.posterUrl,
                     totalSize = 0L,
                     parts = emptyList(),
-                    episodes = episodes
+                    episodes = episodes,
+                    overview = match?.overview,
+                    rating = match?.rating,
+                    runtimeMinutes = match?.runtimeMinutes,
+                    genres = match?.genres ?: emptyList(),
+                    cast = match?.cast ?: emptyList()
                 )
             )
         }

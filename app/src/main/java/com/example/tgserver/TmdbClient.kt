@@ -10,7 +10,12 @@ data class TmdbMatch(
     val title: String,
     val year: Int?,
     val imdbId: String?,
-    val posterUrl: String?
+    val posterUrl: String?,
+    val overview: String? = null,
+    val rating: Double? = null,
+    val runtimeMinutes: Int? = null,
+    val genres: List<String> = emptyList(),
+    val cast: List<String> = emptyList()
 )
 
 object TmdbClient {
@@ -18,8 +23,13 @@ object TmdbClient {
     private const val BASE = "https://api.themoviedb.org/3"
     private const val IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
 
+    // How many billed cast members to keep per title - TMDB returns dozens,
+    // CloudStream's cast row only ever shows a handful, so there's no point
+    // carrying more than this over the wire.
+    private const val MAX_CAST = 6
+
     @Volatile private var apiKey: String = ""
-    
+
     // ConcurrentHashMap requires non-null values; use a sentinel object for "no match"
     private val cache = ConcurrentHashMap<String, TmdbMatch>()
     private val NOT_FOUND = TmdbMatch(title = "", year = null, imdbId = null, posterUrl = null)
@@ -33,7 +43,7 @@ object TmdbClient {
     fun searchMovie(title: String, year: Int?): TmdbMatch? {
         if (!isConfigured() || title.isBlank()) return null
         val cacheKey = "movie:${title.lowercase().trim()}:${year ?: ""}"
-        
+
         cache[cacheKey]?.let {
             return if (it === NOT_FOUND) null else it
         }
@@ -59,16 +69,23 @@ object TmdbClient {
             val resolvedTitle = best.optString("title", title).ifBlank { title }
             val releaseYear = best.optString("release_date", "").take(4).toIntOrNull()
 
-            val imdbId = if (tmdbId != -1) {
-                getJson("$BASE/movie/$tmdbId/external_ids?api_key=$apiKey")
-                    ?.optString("imdb_id", "")?.ifBlank { null }
+            // One extra call (append_to_response) gets the full overview,
+            // runtime, genres, cast AND the imdb id together, instead of
+            // three separate round trips.
+            val details = if (tmdbId != -1) {
+                getJson("$BASE/movie/$tmdbId?api_key=$apiKey&append_to_response=credits,external_ids")
             } else null
 
             TmdbMatch(
                 title = resolvedTitle,
                 year = releaseYear ?: year,
-                imdbId = imdbId,
-                posterUrl = posterPath.ifBlank { null }?.let { "$IMAGE_BASE$it" }
+                imdbId = details?.optJSONObject("external_ids")?.optString("imdb_id", "")?.ifBlank { null },
+                posterUrl = posterPath.ifBlank { null }?.let { "$IMAGE_BASE$it" },
+                overview = (details?.optString("overview") ?: best.optString("overview", "")).ifBlank { null },
+                rating = (details ?: best).optDouble("vote_average", 0.0).takeIf { it > 0.0 },
+                runtimeMinutes = details?.optInt("runtime", 0)?.takeIf { it > 0 },
+                genres = extractGenres(details),
+                cast = extractCast(details)
             )
         }.onFailure {
             FileLogger.error("TmdbClient.searchMovie failed for '$title' ($year)", it)
@@ -82,7 +99,7 @@ object TmdbClient {
     fun searchTv(title: String): TmdbMatch? {
         if (!isConfigured() || title.isBlank()) return null
         val cacheKey = "tv:${title.lowercase().trim()}"
-        
+
         cache[cacheKey]?.let {
             return if (it === NOT_FOUND) null else it
         }
@@ -98,16 +115,27 @@ object TmdbClient {
             val resolvedTitle = best.optString("name", title).ifBlank { title }
             val releaseYear = best.optString("first_air_date", "").take(4).toIntOrNull()
 
-            val imdbId = if (tmdbId != -1) {
-                getJson("$BASE/tv/$tmdbId/external_ids?api_key=$apiKey")
-                    ?.optString("imdb_id", "")?.ifBlank { null }
+            val details = if (tmdbId != -1) {
+                getJson("$BASE/tv/$tmdbId?api_key=$apiKey&append_to_response=credits,external_ids")
             } else null
+
+            // TV shows carry runtime as an array (it can vary by episode/season);
+            // the first entry is the best single number to show.
+            val runtime = details?.optJSONArray("episode_run_time")
+                ?.takeIf { it.length() > 0 }
+                ?.optInt(0, 0)
+                ?.takeIf { it > 0 }
 
             TmdbMatch(
                 title = resolvedTitle,
                 year = releaseYear,
-                imdbId = imdbId,
-                posterUrl = posterPath.ifBlank { null }?.let { "$IMAGE_BASE$it" }
+                imdbId = details?.optJSONObject("external_ids")?.optString("imdb_id", "")?.ifBlank { null },
+                posterUrl = posterPath.ifBlank { null }?.let { "$IMAGE_BASE$it" },
+                overview = (details?.optString("overview") ?: best.optString("overview", "")).ifBlank { null },
+                rating = (details ?: best).optDouble("vote_average", 0.0).takeIf { it > 0.0 },
+                runtimeMinutes = runtime,
+                genres = extractGenres(details),
+                cast = extractCast(details)
             )
         }.onFailure {
             FileLogger.error("TmdbClient.searchTv failed for '$title'", it)
@@ -115,6 +143,21 @@ object TmdbClient {
 
         cache[cacheKey] = result ?: NOT_FOUND
         return result
+    }
+
+    private fun extractGenres(details: JSONObject?): List<String> {
+        val arr = details?.optJSONArray("genres") ?: return emptyList()
+        return (0 until arr.length()).mapNotNull { i ->
+            arr.optJSONObject(i)?.optString("name")?.ifBlank { null }
+        }
+    }
+
+    private fun extractCast(details: JSONObject?): List<String> {
+        val arr = details?.optJSONObject("credits")?.optJSONArray("cast") ?: return emptyList()
+        val limit = minOf(arr.length(), MAX_CAST)
+        return (0 until limit).mapNotNull { i ->
+            arr.optJSONObject(i)?.optString("name")?.ifBlank { null }
+        }
     }
 
     private fun encode(s: String): String = URLEncoder.encode(s, "UTF-8")

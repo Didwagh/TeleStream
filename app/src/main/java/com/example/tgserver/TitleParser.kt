@@ -199,6 +199,12 @@ object TitleParser {
             "webdl",
             "webrip",
             "web",
+            "dl",
+            "hqrip",
+            "camrip",
+            "hdts",
+            "hc",
+            "predvdrip",
             "bluray",
             "blu-ray",
             "brrip",
@@ -574,13 +580,14 @@ object TitleParser {
                 ?.get(1)
                 ?.toIntOrNull()
 
-        // Do NOT let the year cut the title when the year occurs
-        // after the title in a normal release filename.
-        //
-        // But if there is a year before the season marker, the
-        // bracket cleanup below will remove it from the display title.
-        //
-        // We therefore intentionally don't alter cutIndex here.
+        // We don't use the year to move cutIndex (which only exists
+        // to protect season/episode markers) - instead we strip the
+        // year directly out of the title text below. This matters
+        // for MOVIES: "Title.2026.WEB-DL.DDP5.1..." has no season/
+        // episode marker at all, so cutIndex stays at the end of the
+        // string and the year (plus everything after it) would
+        // otherwise leak straight into cleanTitle, breaking the TMDB
+        // search query and losing the poster/metadata match.
         //
         // This is different from the previous parser implementation,
         // which could accidentally make a year determine the title.
@@ -602,6 +609,28 @@ object TitleParser {
                 title,
                 " "
             )
+
+        // Cut the title at a release year, if one remains in it.
+        //
+        // Release names are almost universally "Title Year Tags...",
+        // so once bracketed metadata is gone, a leftover year marks
+        // the real end of the title - along with whatever unknown
+        // release-group/quality tags follow it (which we can never
+        // fully enumerate in noiseTokens below).
+        //
+        // Guarded to only cut when the year isn't the very first
+        // token, so a genuine numeric title like "1917" survives.
+        yearRegex
+            .find(title)
+            ?.let { titleYearMatch ->
+                if (titleYearMatch.range.first > 0) {
+                    title =
+                        title.substring(
+                            0,
+                            titleYearMatch.range.first
+                        )
+                }
+            }
 
         var titleLower =
             title.lowercase()

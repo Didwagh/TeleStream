@@ -44,7 +44,6 @@ data class ChannelItem(
 )
 
 object ChannelCatalogBuilder {
-
     private val splitFileSuffix =
         Regex(
             """\.(part\d+|00\d+|r\d+|mp4|mkv)$""",
@@ -86,7 +85,6 @@ object ChannelCatalogBuilder {
         }
 
         return buildLock.withLock {
-
             if (!forceRefresh &&
                 cachedChatId == chatId &&
                 cache != null
@@ -113,7 +111,6 @@ object ChannelCatalogBuilder {
     }
 
     fun toJson(items: List<ChannelItem>): String {
-
         val arr = JSONArray()
 
         items.forEach { item ->
@@ -287,7 +284,6 @@ object ChannelCatalogBuilder {
             TelegramClient.rawClient()
 
         suspendCancellableCoroutine<Unit> { cont ->
-
             client.send(
                 TdApi.GetChat(chatId)
             ) {
@@ -364,7 +360,6 @@ object ChannelCatalogBuilder {
                     ) {
 
                         is TdApi.MessageVideo -> {
-
                             (
                                 content.video.fileName
                                     .ifBlank {
@@ -375,7 +370,6 @@ object ChannelCatalogBuilder {
                         }
 
                         is TdApi.MessageDocument -> {
-
                             (
                                 content.document.fileName
                                     .ifBlank {
@@ -593,10 +587,7 @@ object ChannelCatalogBuilder {
             val episodes =
                 leavesForSeries
                     .sortedWith(
-                        compareBy<
-                            LeafUnit,
-                            Int
-                        > {
+                        compareBy<LeafUnit> {
                             it.parsed.season
                                 ?: 1
                         }.thenBy {

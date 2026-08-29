@@ -67,48 +67,41 @@ object TelegramClient {
     fun init(context: Context, apiId: Int, apiHash: String) {
         if (client != null) return
 
-        // 1. Explicitly load native JNI library safely
-        try {
+        runCatching {
             System.loadLibrary("tdjni")
-            FileLogger.log("Successfully loaded libtdjni.so")
-        } catch (t: Throwable) {
-            FileLogger.error("Failed to load libtdjni.so", t)
+            FileLogger.log("libtdjni.so loaded")
+        }.onFailure {
+            FileLogger.error("Failed to load libtdjni.so", it)
         }
 
         val dbDir = File(context.filesDir, "tdlib").apply { mkdirs() }.absolutePath
         val filesDir = File(context.cacheDir, "tdlib_files").apply { mkdirs() }.absolutePath
 
-        // 2. Fully populate ALL required string and boolean fields to prevent native SIGSEGV
         tdlibParams = TdApi.SetTdlibParameters().apply {
             this.databaseDirectory = dbDir
             this.filesDirectory = filesDir
             this.useMessageDatabase = true
             this.useSecretChats = false
-            this.useFileDatabase = true
-            this.useChatInfoDatabase = true
             this.apiId = apiId
             this.apiHash = apiHash
             this.systemLanguageCode = "en"
             this.deviceModel = if (Build.MODEL.isNullOrBlank()) "Android" else Build.MODEL
             this.systemVersion = if (Build.VERSION.RELEASE.isNullOrBlank()) "10.0" else Build.VERSION.RELEASE
             this.applicationVersion = "1.0"
-            this.enableStorageOptimizer = true
-            this.ignoreFileNames = false
         }
 
-        try {
+        runCatching {
             Client.execute(TdApi.SetLogVerbosityLevel(1))
-        } catch (e: Throwable) {
-            FileLogger.error("SetLogVerbosityLevel error", e)
+        }.onFailure {
+            FileLogger.error("SetLogVerbosityLevel error", it)
         }
 
-        // 3. Create TDLib client with full error handlers
         client = Client.create({ update ->
             handleUpdate(update)
         }, { updateError ->
             FileLogger.error("TDLib update error: ${updateError?.message}")
         }, { defaultError ->
-            FileLogger.error("TDLib default exception: ${defaultError?.message}")
+            FileLogger.error("TDLib default error: ${defaultError?.message}")
         })
     }
 
@@ -130,7 +123,7 @@ object TelegramClient {
 
         when (update) {
             is TdApi.UpdateAuthorizationState -> {
-                when (val auth = update.authorizationState) {
+                when (update.authorizationState) {
                     is TdApi.AuthorizationStateWaitTdlibParameters -> {
                         tdlibParams?.let { params ->
                             sendSafe(params) { res ->
@@ -138,14 +131,6 @@ object TelegramClient {
                                     FileLogger.error("SetTdlibParameters error: ${res.message}")
                                     authState.value = AuthState.Error(res.message)
                                 }
-                            }
-                        }
-                    }
-                    is TdApi.AuthorizationStateWaitEncryptionKey -> {
-                        sendSafe(TdApi.CheckDatabaseEncryptionKey()) { res ->
-                            if (res is TdApi.Error) {
-                                FileLogger.error("CheckDatabaseEncryptionKey error: ${res.message}")
-                                authState.value = AuthState.Error(res.message)
                             }
                         }
                     }
@@ -171,7 +156,7 @@ object TelegramClient {
         }
     }
 
-    private fun sendSafe(query: TdApi.Function, handler: Client.ResultHandler) {
+    private fun sendSafe(query: TdApi.Function<*>, handler: Client.ResultHandler) {
         val c = client
         if (c != null) {
             c.send(query, handler)

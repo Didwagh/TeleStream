@@ -29,9 +29,8 @@ object GeminiClient {
         val year: Int?
     )
 
-    // Update this if/when a newer Gemini model becomes the recommended
-    // default - kept as a single constant so it's a one-line change.
-    private const val MODEL = "gemini-2.0-flash"
+    // Gemini model matching the working curl request.
+    private const val MODEL = "gemini-2.5-flash-lite"
 
     private const val ENDPOINT =
         "https://generativelanguage.googleapis.com/v1beta/models/$MODEL:generateContent"
@@ -83,7 +82,10 @@ object GeminiClient {
                                 put(
                                     "parts",
                                     org.json.JSONArray().put(
-                                        JSONObject().put("text", prompt)
+                                        JSONObject().put(
+                                            "text",
+                                            prompt
+                                        )
                                     )
                                 )
                             }
@@ -92,22 +94,40 @@ object GeminiClient {
                     put(
                         "generationConfig",
                         JSONObject().apply {
-                            put("temperature", 0.0)
-                            put("responseMimeType", "application/json")
+                            put(
+                                "temperature",
+                                0.0
+                            )
+                            put(
+                                "responseMimeType",
+                                "application/json"
+                            )
                         }
                     )
                 }
 
+            // Matches the working curl:
+            //
+            // curl ".../v1beta/models/gemini-2.5-flash-lite:generateContent"
+            //   -H "Content-Type: application/json"
+            //   -H "X-goog-api-key: ..."
+            //   -X POST
+            //
+            // The API key therefore goes in the X-goog-api-key header,
+            // NOT in the URL query string.
             val responseText =
                 postJson(
-                    "$ENDPOINT?key=$apiKey",
+                    ENDPOINT,
                     body.toString()
-                ) ?: return@runCatching null
+                )
+                    ?: return@runCatching null
 
-            val outer = JSONObject(responseText)
+            val outer =
+                JSONObject(responseText)
 
             val candidateText =
-                outer.optJSONArray("candidates")
+                outer
+                    .optJSONArray("candidates")
                     ?.optJSONObject(0)
                     ?.optJSONObject("content")
                     ?.optJSONArray("parts")
@@ -115,13 +135,22 @@ object GeminiClient {
                     ?.optString("text")
                     ?: return@runCatching null
 
-            val parsed = JSONObject(candidateText.trim())
+            val parsed =
+                JSONObject(
+                    candidateText.trim()
+                )
 
             val typeStr =
-                parsed.optString("type", "movie")
+                parsed.optString(
+                    "type",
+                    "movie"
+                )
 
             val title =
-                parsed.optString("title", "").trim()
+                parsed.optString(
+                    "title",
+                    ""
+                ).trim()
 
             if (title.isBlank()) {
                 return@runCatching null
@@ -131,59 +160,139 @@ object GeminiClient {
                 if (parsed.isNull("year")) {
                     null
                 } else {
-                    parsed.optInt("year", -1).takeIf { it > 1900 }
+                    parsed
+                        .optInt(
+                            "year",
+                            -1
+                        )
+                        .takeIf {
+                            it > 1900
+                        }
                 }
 
             Classification(
                 type =
-                    if (typeStr.equals("series", ignoreCase = true)) {
+                    if (
+                        typeStr.equals(
+                            "series",
+                            ignoreCase = true
+                        )
+                    ) {
                         MediaType.SERIES
                     } else {
                         MediaType.MOVIE
                     },
-                title = title,
-                year = year
+
+                title =
+                    title,
+
+                year =
+                    year
             )
 
         }.onFailure {
+
             FileLogger.error(
                 "GeminiClient.classify failed for '$rawFilename'",
                 it
             )
+
         }.getOrNull()
     }
 
-    private fun postJson(url: String, jsonBody: String): String? {
+    private fun postJson(
+        url: String,
+        jsonBody: String
+    ): String? {
 
         val conn =
-            URL(url).openConnection() as HttpURLConnection
+            URL(url)
+                .openConnection()
+                    as HttpURLConnection
 
         return try {
-            conn.requestMethod = "POST"
-            conn.doOutput = true
-            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            conn.connectTimeout = 15_000
-            conn.readTimeout = 15_000
+
+            conn.requestMethod =
+                "POST"
+
+            conn.doOutput =
+                true
+
+            conn.setRequestProperty(
+                "Content-Type",
+                "application/json"
+            )
+
+            // This matches your working curl exactly:
+            //
+            // -H "X-goog-api-key: ..."
+            //
+            // Do NOT put the API key in the URL.
+            conn.setRequestProperty(
+                "X-goog-api-key",
+                apiKey
+            )
+
+            conn.connectTimeout =
+                15_000
+
+            conn.readTimeout =
+                15_000
 
             conn.outputStream.use { os ->
-                os.write(jsonBody.toByteArray(StandardCharsets.UTF_8))
+
+                os.write(
+                    jsonBody.toByteArray(
+                        StandardCharsets.UTF_8
+                    )
+                )
             }
 
-            val code = conn.responseCode
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val text = stream.bufferedReader().use { it.readText() }
+            val code =
+                conn.responseCode
 
-            if (code !in 200..299) {
-                FileLogger.error("GeminiClient HTTP $code: $text")
+            val stream =
+                if (
+                    code in 200..299
+                ) {
+                    conn.inputStream
+                } else {
+                    conn.errorStream
+                }
+
+            val text =
+                stream
+                    .bufferedReader()
+                    .use {
+                        it.readText()
+                    }
+
+            if (
+                code !in 200..299
+            ) {
+
+                FileLogger.error(
+                    "GeminiClient HTTP $code: $text"
+                )
+
                 null
+
             } else {
+
                 text
             }
 
         } catch (e: Exception) {
-            FileLogger.error("GeminiClient request failed", e)
+
+            FileLogger.error(
+                "GeminiClient request failed",
+                e
+            )
+
             null
+
         } finally {
+
             conn.disconnect()
         }
     }

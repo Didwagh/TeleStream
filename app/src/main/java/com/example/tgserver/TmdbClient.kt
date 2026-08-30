@@ -26,6 +26,12 @@ object TmdbClient {
     private const val IMAGE_BASE =
         "https://image.tmdb.org/t/p/w500"
 
+    // BetterPosters/Btttr uses the IMDb id to generate its poster.
+    // Keep this as a poster-only enhancement; TMDB remains the source
+    // for title matching and the rest of the metadata.
+    private const val BETTER_POSTER_BASE =
+        "https://btttr.cc/poster/imdb/poster-default"
+
     private const val MAX_CAST = 6
 
     @Volatile
@@ -48,6 +54,26 @@ object TmdbClient {
 
     fun isConfigured(): Boolean =
         apiKey.isNotBlank()
+
+    /**
+     * Build a BetterPosters/Btttr poster URL from a valid IMDb id.
+     * Returns null when the id is not usable, so callers can fall back
+     * to the existing TMDB poster without changing the rest of the flow.
+     */
+    private fun betterPosterUrl(
+        imdbId: String?
+    ): String? {
+        val id =
+            imdbId
+                ?.trim()
+                ?.takeIf {
+                    it.startsWith("tt") &&
+                        it.length > 2
+                }
+                ?: return null
+
+        return "$BETTER_POSTER_BASE/$id.jpg"
+    }
 
     fun searchMovie(
         title: String,
@@ -171,6 +197,28 @@ object TmdbClient {
                         .take(4)
                         .toIntOrNull()
 
+                val imdbId =
+                    details
+                        ?.optJSONObject(
+                            "external_ids"
+                        )
+                        ?.optString(
+                            "imdb_id",
+                            ""
+                        )
+                        ?.ifBlank {
+                            null
+                        }
+
+                val tmdbPosterUrl =
+                    fallbackImagePath
+                        .ifBlank {
+                            null
+                        }
+                        ?.let {
+                            "$IMAGE_BASE$it"
+                        }
+
                 TmdbMatch(
                     title =
                         resolvedTitle,
@@ -180,26 +228,13 @@ object TmdbClient {
                             ?: year,
 
                     imdbId =
-                        details
-                            ?.optJSONObject(
-                                "external_ids"
-                            )
-                            ?.optString(
-                                "imdb_id",
-                                ""
-                            )
-                            ?.ifBlank {
-                                null
-                            },
+                        imdbId,
 
+                    // Prefer the BetterPosters image when the matched
+                    // title has an IMDb id; otherwise retain TMDB.
                     posterUrl =
-                        fallbackImagePath
-                            .ifBlank {
-                                null
-                            }
-                            ?.let {
-                                "$IMAGE_BASE$it"
-                            },
+                        betterPosterUrl(imdbId)
+                            ?: tmdbPosterUrl,
 
                     overview =
                         (
@@ -357,7 +392,6 @@ object TmdbClient {
                         "poster_path",
                         ""
                     ).ifBlank {
-
                         details?.optString(
                             "poster_path",
                             ""
@@ -407,6 +441,28 @@ object TmdbClient {
                             it > 0
                         }
 
+                val imdbId =
+                    details
+                        ?.optJSONObject(
+                            "external_ids"
+                        )
+                        ?.optString(
+                            "imdb_id",
+                            ""
+                        )
+                        ?.ifBlank {
+                            null
+                        }
+
+                val tmdbPosterUrl =
+                    fallbackImagePath
+                        .ifBlank {
+                            null
+                        }
+                        ?.let {
+                            "$IMAGE_BASE$it"
+                        }
+
                 TmdbMatch(
                     title =
                         resolvedTitle,
@@ -416,26 +472,13 @@ object TmdbClient {
                             ?: year,
 
                     imdbId =
-                        details
-                            ?.optJSONObject(
-                                "external_ids"
-                            )
-                            ?.optString(
-                                "imdb_id",
-                                ""
-                            )
-                            ?.ifBlank {
-                                null
-                            },
+                        imdbId,
 
+                    // Prefer BetterPosters when an IMDb id exists,
+                    // otherwise use the existing TMDB image.
                     posterUrl =
-                        fallbackImagePath
-                            .ifBlank {
-                                null
-                            }
-                            ?.let {
-                                "$IMAGE_BASE$it"
-                            },
+                        betterPosterUrl(imdbId)
+                            ?: tmdbPosterUrl,
 
                     overview =
                         (

@@ -25,9 +25,18 @@ data class CatalogItem(
 
 object CatalogRepository {
 
-    fun fetchCatalog(baseUrl: String, channelId: Long, forceRefresh: Boolean = false): List<CatalogItem> {
+    fun fetchCatalog(
+        baseUrl: String,
+        channelId: Long,
+        forceRefresh: Boolean = false,
+        // Ignore the persisted/incremental cache and walk the whole
+        // channel from scratch, re-spending TMDB/Gemini calls on
+        // everything. Use sparingly - see ChannelCatalogBuilder's kdoc.
+        fullRebuild: Boolean = false
+    ): List<CatalogItem> {
         val refreshParam = if (forceRefresh) "&refresh=1" else ""
-        val fullUrl = "$baseUrl/catalog?channel_id=$channelId$refreshParam"
+        val fullRebuildParam = if (fullRebuild) "&full_rebuild=1" else ""
+        val fullUrl = "$baseUrl/catalog?channel_id=$channelId$refreshParam$fullRebuildParam"
         FileLogger.log("CatalogRepository fetching: $fullUrl")
 
         val conn = URL(fullUrl).openConnection() as HttpURLConnection

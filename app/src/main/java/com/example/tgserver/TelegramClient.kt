@@ -208,36 +208,17 @@ object TelegramClient {
         }
     }
 
-    /**
-     * Warmed up for the active file. Automatically stops after 15s if playback doesn't start, 
-     * preventing endless background data drainage.
-     */
-    fun warmupFile(chatId: Long, messageId: Long) {
-        val c = rawClient()
-        c.send(TdApi.GetMessage(chatId, messageId)) { msgRes ->
-            if (msgRes is TdApi.Message) {
-                val file = when (val content = msgRes.content) {
-                    is TdApi.MessageVideo -> content.video.video
-                    is TdApi.MessageDocument -> content.document.document
-                    else -> null
-                }
-                if (file != null && !file.local.isDownloadingCompleted) {
-                    c.send(TdApi.DownloadFile(file.id, 32, 0, 0, false)) {
-                        FileLogger.log("Warmup started for fileId=${file.id}")
-                    }
-                    
-                    Thread {
-                        Thread.sleep(15_000)
-                        val count = activeStreamCounts[file.id] ?: 0
-                        if (count <= 0) {
-                            c.send(TdApi.CancelDownloadFile(file.id, false)) {}
-                            FileLogger.log("Warmup cancelled for fileId=${file.id} to save data")
-                        }
-                    }.start()
-                }
-            }
-        }
-    }
+    // NOTE: there used to be a warmupFile(chatId, messageId) here, called
+    // from LocalStreamServer's /warmup route. It issued its own
+    // whole-file TdApi.DownloadFile(offset=0, limit=0) completely
+    // separate from the ChunkBridge that /video actually reads from, then
+    // auto-cancelled itself after 15s by checking activeStreamCounts -
+    // which is only ever incremented by the abandoned streamFilePart()
+    // path below, never by /video's real ChunkBridge path. So it always
+    // downloaded far more than needed and then almost always cancelled
+    // itself regardless of whether playback had started. Removed - see
+    // LocalStreamServer.serveWarmup()/startHeadTailPrefetch(), which now
+    // warms the SAME ChunkBridge /video reads from instead.
 
     /**
      * Streams targeted byte ranges on-demand natively using TDLib.

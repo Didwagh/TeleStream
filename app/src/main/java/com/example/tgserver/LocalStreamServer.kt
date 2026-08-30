@@ -81,10 +81,23 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
      * GET /warmup?chat_id=X&message_id=Y
      * Called from the CloudStream plugin's load() (movie detail screen) so
      * TDLib has already started fetching the first bytes of the file by the
-     * time the user taps Play. Delegates to TelegramClient.warmupFile,
-     * which auto-cancels itself after 15s if nothing consumes the file, so
-     * this never leaks a runaway download. Always answers immediately -
-     * the actual downloading happens on TDLib's own thread.
+     * time the user taps Play.
+     *
+     * This USED to delegate to TelegramClient.warmupFile(), which kicked
+     * off its own whole-file DownloadFile call (offset=0, limit=0 - i.e.
+     * "download to the end") completely separate from the ChunkBridge that
+     * /video actually reads from, then auto-cancelled itself after 15s
+     * based on an "active stream" counter that is only ever incremented by
+     * the abandoned TelegramClient.streamFilePart() path - NOT by /video's
+     * real ChunkBridge-based path. Net effect: it downloaded far more than
+     * needed and then cancelled itself basically every time, regardless of
+     * whether playback had actually started, because the counter it
+     * checked was always 0. That's the "warmup was cancelled" behavior
+     * seen in the logs.
+     *
+     * Fixed by routing through the same getOrResolve()/ChunkBridge that
+     * /prefetch and /video use, so the bytes this warms up are the exact
+     * same ones /video will ask for - nothing wasted, nothing orphaned.
      */
     private fun serveWarmup(session: IHTTPSession): Response {
         val chatId = session.parameters["chat_id"]?.firstOrNull()?.toLongOrNull()
@@ -93,11 +106,7 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
             return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "missing chat_id/message_id")
         }
         FileLogger.log("Warmup requested: chatId=$chatId messageId=$messageId")
-        try {
-            TelegramClient.warmupFile(chatId, messageId)
-        } catch (e: Exception) {
-            FileLogger.error("Warmup failed for chatId=$chatId messageId=$messageId", e)
-        }
+        startHeadTailPrefetch(chatId, messageId)
         return newFixedLengthResponse(Response.Status.OK, "text/plain", "OK")
     }
 
@@ -157,6 +166,26 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
             return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "missing chat_id/message_id")
         }
 
+        startHeadTailPrefetch(chatId, messageId)
+
+        // Ack immediately - the actual downloading happens in the
+        // background via the coroutine launched above, not before this
+        // response is sent.
+        return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\":\"prefetch_started\"}")
+    }
+
+    /**
+     * Shared by /warmup and /prefetch: resolves the file (or reuses the
+     * ChunkBridge already cached for it) and kicks off a background
+     * download of the first ~2MB (for immediate playback start) and the
+     * last ~2MB (in case this file's MP4 index/moov atom sits at the end
+     * rather than the start). Never blocks the caller - the actual
+     * downloading happens on the coroutine launched here, via the same
+     * ChunkBridge instance /video will read from, so none of this work is
+     * wasted or orphaned regardless of which endpoint(s) called it or how
+     * many times.
+     */
+    private fun startHeadTailPrefetch(chatId: Long, messageId: Long) {
         serverScope.launch {
             try {
                 val entry = getOrResolve(chatId, messageId)
@@ -173,11 +202,6 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
                 FileLogger.error("Prefetch resolve failed for chatId=$chatId messageId=$messageId", e)
             }
         }
-
-        // Ack immediately - the actual downloading happens in the
-        // background via the coroutine launched above, not before this
-        // response is sent.
-        return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\":\"prefetch_started\"}")
     }
 
     private fun serveCatalog(session: IHTTPSession): Response {
@@ -187,16 +211,21 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
             return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "missing channel_id")
         }
         val forceRefresh = session.parameters["refresh"]?.firstOrNull() == "1"
-        FileLogger.log("Catalog request: channelId=$channelId forceRefresh=$forceRefresh")
+        val fullRebuild = session.parameters["full_rebuild"]?.firstOrNull() == "1"
+        FileLogger.log("Catalog request: channelId=$channelId forceRefresh=$forceRefresh fullRebuild=$fullRebuild")
 
-        if (forceRefresh) {
-            // Explicit, deliberate action (manual refresh button or browser
-            // test) - acceptable to actually wait here, since the caller
-            // asked for a fresh rebuild on purpose and has its own "loading"
-            // feedback while it waits.
+        if (forceRefresh || fullRebuild) {
+            // Explicit, deliberate action (manual refresh/full-rebuild
+            // button or browser test) - acceptable to actually wait here,
+            // since the caller asked for a sync on purpose and has its own
+            // "loading" feedback while it waits. Note this is normally a
+            // fast INCREMENTAL sync now (see ChannelCatalogBuilder) unless
+            // full_rebuild=1 was explicitly requested.
             return try {
-                val items = runBlocking { ChannelCatalogBuilder.getCatalog(channelId, true) }
-                FileLogger.log("Catalog rebuilt (blocking, requested): ${items.size} item(s)")
+                val items = runBlocking {
+                    ChannelCatalogBuilder.getCatalog(channelId, forceRefresh = true, fullRebuild = fullRebuild)
+                }
+                FileLogger.log("Catalog synced (blocking, requested): ${items.size} item(s)")
                 newFixedLengthResponse(Response.Status.OK, "application/json", ChannelCatalogBuilder.toJson(items))
             } catch (e: Exception) {
                 FileLogger.error("Catalog rebuild failed", e)

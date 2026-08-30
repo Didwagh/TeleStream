@@ -77,6 +77,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         FileLogger.init(applicationContext)
+        ChannelCatalogBuilder.init(applicationContext)
         prefs = getSharedPreferences("tgserver_prefs", MODE_PRIVATE)
 
         if (Build.VERSION.SDK_INT >= 33) {
@@ -517,17 +518,32 @@ class MainActivity : AppCompatActivity() {
         }
         container.addView(toggleButton)
 
-        val fetchButton = orangeButton("Refresh Catalog") { fetchAndShowCatalog() }
+        val fetchButton = orangeButton("Refresh Catalog") { fetchAndShowCatalog(fullRebuild = false) }
         container.addView(fetchButton)
+
+        val fullRebuildButton = orangeButton("Full Rebuild (Slow)") { fetchAndShowCatalog(fullRebuild = true) }
+        container.addView(fullRebuildButton)
+        addText(
+            "Refresh Catalog = fast incremental sync (only new files since last time). " +
+                "Full Rebuild = re-scans everything and re-spends every TMDB/Gemini lookup - " +
+                "only use it if something looks wrong or you renamed/edited files already synced before.",
+            12f
+        )
     }
 
-    private fun fetchAndShowCatalog() {
+    private fun fetchAndShowCatalog(fullRebuild: Boolean) {
         val channelId = prefs.getLong("channel_id", 0L)
         lifecycleScope.launch {
-            addText("Rebuilding catalog from Telegram & TMDB...")
+            addText(
+                if (fullRebuild) {
+                    "Full rebuild: re-scanning everything from Telegram & TMDB/Gemini..."
+                } else {
+                    "Syncing catalog (new files only)..."
+                }
+            )
             val items = try {
                 withContext(Dispatchers.IO) {
-                    CatalogRepository.fetchCatalog(localBaseUrl, channelId, forceRefresh = true)
+                    CatalogRepository.fetchCatalog(localBaseUrl, channelId, forceRefresh = true, fullRebuild = fullRebuild)
                 }
             } catch (e: Exception) {
                 addText("Catalog error: ${e.message}")

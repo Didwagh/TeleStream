@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!--
+        Base theme for the app's signature look: near-black background,
+        orange accent. No action bar - the app draws its own tab bar in
+        MainActivity instead. The actual view colors are still set
+        programmatically in MainActivity's `Theme` object; this theme just
+        makes sure the window background / status bar / any
+        system-rendered chrome (dialogs, etc.) matches instead of
+        defaulting to AppCompat's light theme.
+    -->
+    <style name="AppTheme" parent="Theme.AppCompat.NoActionBar">
+        <item name="colorPrimary">@color/app_surface</item>
+        <item name="colorPrimaryDark">@color/app_bg</item>
+        <item name="colorAccent">@color/app_accent</item>
+        <item name="android:windowBackground">@color/app_bg</item>
+        <item name="android:textColorPrimary">@color/app_text_primary</item>
+        <item name="android:textColorSecondary">@color/app_text_muted</item>
+        <item name="android:statusBarColor" tools:targetApi="21">@color/app_bg</item>
+    </style>
+</resources>

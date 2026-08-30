@@ -24,7 +24,12 @@ data class EpisodeEntry(
     val episode: Int,
     val episodeEnd: Int? = null,
     val totalSize: Long,
-    val parts: List<FilePart>
+    val parts: List<FilePart>,
+    // Set for a leaf that had no real S0xE0x numbering but was rerouted
+    // into the series bucket anyway (a "combined" whole-series/season
+    // file, or a Gemini-classified series). Lets the client show
+    // something more honest than a fake "Episode 1".
+    val label: String? = null
 )
 
 data class ChannelItem(
@@ -239,6 +244,11 @@ object ChannelCatalogBuilder {
             epObj.put(
                 "total_size",
                 ep.totalSize
+            )
+
+            epObj.put(
+                "label",
+                ep.label ?: JSONObject.NULL
             )
 
             val epParts =
@@ -461,7 +471,7 @@ object ChannelCatalogBuilder {
                 )
             }
 
-        val movieLeaves =
+        val rawMovieLeaves =
             leaves.filter {
                 !it.parsed.isEpisode
             }
@@ -471,13 +481,41 @@ object ChannelCatalogBuilder {
                 it.parsed.isEpisode
             }
 
+        // --------------------------------------------------------
+        // "Combined" reroute.
+        //
+        // Some releases package a WHOLE series/season as one single
+        // video file with no S0xE0x marker anywhere in the name, only
+        // the word "combined" (e.g. how the user's actual "Pritam And
+        // Pedro ... COMBINED" file showed up). Without this, such a
+        // leaf has isEpisode == false and silently gets treated - and
+        // TMDB-movie-searched - as a movie, which is exactly why it
+        // never gets a poster or plot: it isn't one.
+        //
+        // These leaves have season == null / episode == null, which
+        // the series-building loop below already falls back to
+        // season=1/episode=1 for, so no further special-casing is
+        // needed there - we just need to route them into
+        // seriesGroups instead of movieLeaves.
+        // --------------------------------------------------------
+
+        val movieLeaves =
+            rawMovieLeaves.filter {
+                !it.parsed.hasCombinedMarker
+            }
+
+        val combinedAsSeriesLeaves =
+            rawMovieLeaves.filter {
+                it.parsed.hasCombinedMarker
+            }
+
         val seriesGroups =
             LinkedHashMap<
                 String,
                 MutableList<LeafUnit>
             >()
 
-        episodeLeaves.forEach { leaf ->
+        (episodeLeaves + combinedAsSeriesLeaves).forEach { leaf ->
 
             val key =
                 leaf.parsed.cleanTitle
@@ -498,16 +536,58 @@ object ChannelCatalogBuilder {
         // MOVIES
         // --------------------------------------------------------
 
+        // Leaves that Gemini reclassifies as series get diverted here
+        // instead of being added as (badly-matched) movies below.
+        val geminiReroutedToSeries =
+            mutableListOf<
+                Pair<LeafUnit, GeminiClient.Classification>
+            >()
+
         for (leaf in movieLeaves) {
 
             val parsed =
                 leaf.parsed
 
-            val match =
+            var match =
                 TmdbClient.searchMovie(
                     parsed.cleanTitle,
                     parsed.year
                 )
+
+            // Optional, opt-in second opinion. Only runs when a Gemini
+            // API key has been configured AND the plain TMDB movie
+            // search above came up empty - never on the happy path, so
+            // this never adds cost/latency to the common case.
+            var geminiMatch: GeminiClient.Classification? = null
+
+            if (match == null && GeminiClient.isConfigured()) {
+
+                val rawName =
+                    leaf.parts.firstOrNull()?.originalName
+                        ?: parsed.cleanTitle
+
+                geminiMatch =
+                    GeminiClient.classify(rawName)
+
+                if (
+                    geminiMatch != null &&
+                    geminiMatch.type == GeminiClient.MediaType.SERIES
+                ) {
+                    geminiReroutedToSeries.add(
+                        leaf to geminiMatch
+                    )
+                    continue
+                }
+
+                if (geminiMatch != null) {
+                    match =
+                        TmdbClient.searchMovie(
+                            geminiMatch.title,
+                            geminiMatch.year
+                                ?: parsed.year
+                        )
+                }
+            }
 
             result.add(
                 ChannelItem(
@@ -515,10 +595,12 @@ object ChannelCatalogBuilder {
 
                     title =
                         match?.title
+                            ?: geminiMatch?.title
                             ?: parsed.cleanTitle,
 
                     year =
                         match?.year
+                            ?: geminiMatch?.year
                             ?: parsed.year,
 
                     imdbId =
@@ -554,6 +636,27 @@ object ChannelCatalogBuilder {
                             ?: emptyList()
                 )
             )
+        }
+
+        // --------------------------------------------------------
+        // Fold Gemini-reclassified "actually a series" leaves into
+        // the same seriesGroups map the combined-reroute above uses,
+        // so they go through identical grouping/TMDB-TV logic rather
+        // than a separate one-off code path.
+        // --------------------------------------------------------
+
+        geminiReroutedToSeries.forEach { (leaf, classification) ->
+
+            val key =
+                classification.title
+                    .lowercase()
+                    .trim()
+
+            seriesGroups
+                .getOrPut(key) {
+                    mutableListOf()
+                }
+                .add(leaf)
         }
 
         // --------------------------------------------------------
@@ -601,6 +704,14 @@ object ChannelCatalogBuilder {
                     )
                     .map { leaf ->
 
+                        // No real season/episode numbers means this leaf
+                        // only got here via the "combined" reroute or the
+                        // Gemini series-reclassification above - label it
+                        // honestly instead of pretending it's "Episode 1".
+                        val isWholeSeriesFile =
+                            leaf.parsed.season == null &&
+                                leaf.parsed.episode == null
+
                         EpisodeEntry(
                             season =
                                 leaf.parsed.season
@@ -617,7 +728,14 @@ object ChannelCatalogBuilder {
                                 leaf.totalSize,
 
                             parts =
-                                leaf.parts
+                                leaf.parts,
+
+                            label =
+                                if (isWholeSeriesFile) {
+                                    "Full Series (Single File)"
+                                } else {
+                                    null
+                                }
                         )
                     }
 

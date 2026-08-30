@@ -22,7 +22,15 @@ object TitleParser {
         val year: Int?,
         val season: Int?,
         val episode: Int?,
-        val episodeEnd: Int? = null
+        val episodeEnd: Int? = null,
+        // True when the raw filename contains the word "combined" -
+        // a strong signal (in this library's release naming) that a
+        // WHOLE series/season was packaged as one single video file,
+        // even though no S0xE0x marker is present to prove it's an
+        // episode. See ChannelCatalogBuilder: leaves with this flag
+        // set are rerouted into the series bucket instead of being
+        // treated (and TMDB-movie-searched) as a movie.
+        val hasCombinedMarker: Boolean = false
     ) {
         val isEpisode: Boolean
             get() =
@@ -132,6 +140,15 @@ object TitleParser {
     private val seasonOnlyRegex =
         Regex(
             """\b[Ss](\d{1,2})\b"""
+        )
+
+    // Detected independently of the noise-token pass (which strips
+    // "combined" out of the display title) so the signal survives
+    // even though the word itself disappears from cleanTitle.
+    private val combinedMarkerRegex =
+        Regex(
+            """\bcombined\b""",
+            RegexOption.IGNORE_CASE
         )
 
     // ------------------------------------------------------------
@@ -699,7 +716,10 @@ object TitleParser {
                 episode,
 
             episodeEnd =
-                episodeEnd
+                episodeEnd,
+
+            hasCombinedMarker =
+                combinedMarkerRegex.containsMatchIn(working)
         )
     }
 }

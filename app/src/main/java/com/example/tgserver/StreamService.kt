@@ -66,6 +66,7 @@ class StreamService : Service() {
         // in principle start first, and ChannelCatalogBuilder needs a
         // Context to read/write its on-disk catalog cache.
         ChannelCatalogBuilder.init(applicationContext)
+        DataUsageTracker.init(applicationContext)
         createChannel()
     }
 

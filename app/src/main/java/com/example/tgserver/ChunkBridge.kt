@@ -108,6 +108,12 @@ class ChunkBridge(
         }
         if (alreadyHave) return
 
+        if (DataUsageTracker.isBlocked()) {
+            throw RuntimeException(
+                "Video data limit reached - raise or reset it in TeleStream's Settings tab"
+            )
+        }
+
         val client = TelegramClient.rawClient()
 
         try {
@@ -120,6 +126,7 @@ class ChunkBridge(
                         val covered = downloadedTo >= (offset + limit) || f.local.isDownloadingCompleted
                         if (covered && cont.isActive) {
                             synchronized(fetchedLock) { fetchedRanges.add(offset..(offset + limit)) }
+                            DataUsageTracker.addVideoBytes(limit)
                             TelegramClient.removeFileListener(fileId, listener)
                             cont.resume(Unit)
                         }

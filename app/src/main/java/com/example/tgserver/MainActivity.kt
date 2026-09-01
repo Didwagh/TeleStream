@@ -76,9 +76,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var logsRoot: LinearLayout
     private lateinit var logsTextView: TextView
     private lateinit var logsScroll: ScrollView
+    private lateinit var settingsScroll: ScrollView
     private lateinit var homeTabButton: Button
     private lateinit var logsTabButton: Button
+    private lateinit var settingsTabButton: Button
     private var logsCollectorJob: Job? = null
+
+    private enum class Tab { HOME, LOGS, SETTINGS }
 
     private lateinit var createLogDocLauncher: ActivityResultLauncher<String>
 
@@ -89,6 +93,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         FileLogger.init(applicationContext)
         ChannelCatalogBuilder.init(applicationContext)
+        DataUsageTracker.init(applicationContext)
         prefs = getSharedPreferences("tgserver_prefs", MODE_PRIVATE)
 
         if (Build.VERSION.SDK_INT >= 33) {
@@ -140,8 +145,13 @@ class MainActivity : AppCompatActivity() {
         logsRoot.visibility = View.GONE
         contentFrame.addView(logsRoot)
 
+        // --- Settings tab content ---
+        settingsScroll = buildSettingsTab()
+        settingsScroll.visibility = View.GONE
+        contentFrame.addView(settingsScroll)
+
         setContentView(root)
-        selectTab(showLogs = false)
+        selectTab(Tab.HOME)
 
         val savedApiId = prefs.getInt("api_id", 0)
         val savedApiHash = prefs.getString("api_hash", "") ?: ""
@@ -254,24 +264,23 @@ class MainActivity : AppCompatActivity() {
 
         homeTabButton = styledTabButton("Home")
         logsTabButton = styledTabButton("Logs")
+        settingsTabButton = styledTabButton("Settings")
 
-        homeTabButton.setOnClickListener { selectTab(showLogs = false) }
-        logsTabButton.setOnClickListener { selectTab(showLogs = true) }
+        homeTabButton.setOnClickListener { selectTab(Tab.HOME) }
+        logsTabButton.setOnClickListener { selectTab(Tab.LOGS) }
+        settingsTabButton.setOnClickListener { selectTab(Tab.SETTINGS) }
 
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(Theme.bg)
             setPadding(padH, 0, padH, dp(12))
-            addView(
-                homeTabButton,
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            )
-            val spacer = View(this@MainActivity)
-            addView(spacer, LinearLayout.LayoutParams(dp(8), 1))
-            addView(
-                logsTabButton,
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            )
+            listOf(homeTabButton, logsTabButton, settingsTabButton).forEachIndexed { index, btn ->
+                if (index > 0) {
+                    val spacer = View(this@MainActivity)
+                    addView(spacer, LinearLayout.LayoutParams(dp(8), 1))
+                }
+                addView(btn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            }
         }
     }
 
@@ -287,20 +296,29 @@ class MainActivity : AppCompatActivity() {
             elevation = 0f
         }
 
-    private fun selectTab(showLogs: Boolean) {
-        homeScroll.visibility = if (showLogs) View.GONE else View.VISIBLE
-        logsRoot.visibility = if (showLogs) View.VISIBLE else View.GONE
+    private fun selectTab(tab: Tab) {
+        homeScroll.visibility = if (tab == Tab.HOME) View.VISIBLE else View.GONE
+        logsRoot.visibility = if (tab == Tab.LOGS) View.VISIBLE else View.GONE
+        settingsScroll.visibility = if (tab == Tab.SETTINGS) View.VISIBLE else View.GONE
 
-        homeTabButton.background = roundedDrawable(if (showLogs) Theme.surfaceAlt else Theme.accent, radiusDp = 20)
-        homeTabButton.setTextColor(if (showLogs) Theme.textPrimary else Color.BLACK)
+        listOf(
+            homeTabButton to Tab.HOME,
+            logsTabButton to Tab.LOGS,
+            settingsTabButton to Tab.SETTINGS
+        ).forEach { (btn, t) ->
+            val selected = t == tab
+            btn.background = roundedDrawable(if (selected) Theme.accent else Theme.surfaceAlt, radiusDp = 20)
+            btn.setTextColor(if (selected) Color.BLACK else Theme.textPrimary)
+        }
 
-        logsTabButton.background = roundedDrawable(if (showLogs) Theme.accent else Theme.surfaceAlt, radiusDp = 20)
-        logsTabButton.setTextColor(if (showLogs) Color.BLACK else Theme.textPrimary)
-
-        if (showLogs) {
+        if (tab == Tab.LOGS) {
             startLogsCollector()
         } else {
             logsCollectorJob?.cancel()
+        }
+
+        if (tab == Tab.SETTINGS) {
+            refreshSettingsFields()
         }
     }
 
@@ -360,6 +378,277 @@ class MainActivity : AppCompatActivity() {
             addView(logsScroll)
             addView(buttonRow)
         }
+    }
+
+    // ------------------------------------------------------------
+    // Settings tab - edit TMDB/Gemini keys (and channel_id) without
+    // clearing prefs and redoing the whole Telegram login flow. You do
+    // NOT need to clear the catalog cache after changing these - existing
+    // cached items keep whatever they already resolved; a saved key just
+    // applies to whatever gets classified from here on (tap "Refresh
+    // Catalog" on Home for new files, or "Full Rebuild" if you want
+    // already-cached items re-matched with the new key too).
+    // ------------------------------------------------------------
+
+    private lateinit var settingsChannelInput: EditText
+    private lateinit var settingsTmdbInput: EditText
+    private lateinit var settingsGeminiInput: EditText
+    private lateinit var settingsCapInput: EditText
+    private lateinit var settingsUsageText: TextView
+    private lateinit var blockModeButton: Button
+    private lateinit var notifyModeButton: Button
+    private var settingsSelectedMode: DataUsageTracker.Mode = DataUsageTracker.Mode.BLOCK
+
+    private fun buildSettingsTab(): ScrollView {
+        val padH = dp(16)
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(padH, dp(14), padH, dp(24))
+        }
+
+        val header = TextView(this).apply {
+            text = "Settings"
+            textSize = 18f
+            setTextColor(Theme.textPrimary)
+            setTypeface(typeface, Typeface.BOLD)
+        }
+        col.addView(header)
+
+        val sub = TextView(this).apply {
+            text = "Changes here apply immediately - no need to clear the app's cache or log back into Telegram."
+            textSize = 12f
+            setTextColor(Theme.textMuted)
+        }
+        col.addView(sub, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(4) })
+
+        val channelCard = card()
+        val channelLabel = TextView(this).apply {
+            text = "Telegram Channel ID"
+            setTextColor(Theme.textMuted)
+            textSize = 12f
+        }
+        settingsChannelInput = styledEditText("channel_id (e.g. -1001234567890)").apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED
+        }
+        channelCard.addView(channelLabel)
+        channelCard.addView(settingsChannelInput, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(6) })
+        col.addView(channelCard, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(18) })
+
+        val keysLabel = TextView(this).apply {
+            text = "METADATA ENRICHMENT"
+            textSize = 12f
+            setTextColor(Theme.accent)
+            setTypeface(typeface, Typeface.BOLD)
+            letterSpacing = 0.06f
+        }
+        col.addView(keysLabel, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(18) })
+
+        val keysCard = card()
+        val tmdbLabel = TextView(this).apply {
+            text = "TMDB API Key (32-character v3 key)"
+            setTextColor(Theme.textMuted)
+            textSize = 12f
+        }
+        settingsTmdbInput = styledEditText("tmdb_api_key")
+        val geminiLabel = TextView(this).apply {
+            text = "Gemini API Key (optional fallback for hard-to-match titles)"
+            setTextColor(Theme.textMuted)
+            textSize = 12f
+        }
+        settingsGeminiInput = styledEditText("gemini_api_key")
+        keysCard.addView(tmdbLabel)
+        keysCard.addView(settingsTmdbInput, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(6) })
+        keysCard.addView(geminiLabel, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(14) })
+        keysCard.addView(settingsGeminiInput, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(6) })
+        col.addView(keysCard, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(8) })
+
+        val dataLabel = TextView(this).apply {
+            text = "VIDEO DATA LIMIT"
+            textSize = 12f
+            setTextColor(Theme.accent)
+            setTypeface(typeface, Typeface.BOLD)
+            letterSpacing = 0.06f
+        }
+        col.addView(dataLabel, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(18) })
+
+        val dataCard = card()
+
+        settingsUsageText = TextView(this).apply {
+            textSize = 14f
+            setTextColor(Theme.textPrimary)
+            setTypeface(typeface, Typeface.BOLD)
+        }
+        dataCard.addView(settingsUsageText)
+
+        val resetUsageButton = secondaryButton("Reset Usage Counter") {
+            DataUsageTracker.resetUsage()
+            refreshSettingsFields()
+            Toast.makeText(this, "Usage counter reset", Toast.LENGTH_SHORT).show()
+        }
+        dataCard.addView(resetUsageButton, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(10) })
+
+        val capLabel = TextView(this).apply {
+            text = "Cap (MB, 0 = unlimited)"
+            setTextColor(Theme.textMuted)
+            textSize = 12f
+        }
+        dataCard.addView(capLabel, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(16) })
+
+        settingsCapInput = styledEditText("0").apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        dataCard.addView(settingsCapInput, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(6) })
+
+        val presetsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        listOf("500 MB" to 500L, "1 GB" to 1024L, "2 GB" to 2048L, "5 GB" to 5120L, "Unlimited" to 0L)
+            .forEachIndexed { index, (label, mb) ->
+                val btn = secondaryButton(label) { settingsCapInput.setText(mb.toString()) }
+                btn.textSize = 11f
+                val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                if (index > 0) lp.marginStart = dp(6)
+                presetsRow.addView(btn, lp)
+            }
+        dataCard.addView(presetsRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(8) })
+
+        val modeLabel = TextView(this).apply {
+            text = "When the limit is reached"
+            setTextColor(Theme.textMuted)
+            textSize = 12f
+        }
+        dataCard.addView(modeLabel, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(16) })
+
+        blockModeButton = secondaryButton("Block new streams") { setDataCapMode(DataUsageTracker.Mode.BLOCK) }
+        notifyModeButton = secondaryButton("Notify only, keep streaming") { setDataCapMode(DataUsageTracker.Mode.NOTIFY_ONLY) }
+        val modeRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        modeRow.addView(blockModeButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        modeRow.addView(notifyModeButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).also { it.marginStart = dp(6) })
+        dataCard.addView(modeRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(6) })
+
+        col.addView(dataCard, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(8) })
+
+        val dataNote = TextView(this).apply {
+            text = "\"Block\" also sends a one-time notification the moment the cap is hit - it's not silent. " +
+                "Already-downloaded parts of a video keep working either way; this only stops NEW data " +
+                "from being pulled. Doesn't cover the catalog/TMDB/Gemini traffic, which is tiny JSON."
+            textSize = 12f
+            setTextColor(Theme.textMuted)
+        }
+        col.addView(dataNote, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(8) })
+
+        val saveButton = orangeButton("Save Settings") { onSaveSettings() }
+        col.addView(saveButton, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(20) })
+
+        val note = TextView(this).apply {
+            text = "Telegram api_id/api_hash can't be changed here, since that requires " +
+                "restarting the whole Telegram login flow. Use \"Start Over\" from an auth " +
+                "error screen, or clear the app's storage, if you need to change those."
+            textSize = 12f
+            setTextColor(Theme.textMuted)
+        }
+        col.addView(note, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(14) })
+
+        return ScrollView(this).apply {
+            setBackgroundColor(Theme.bg)
+            addView(col)
+        }
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        val mb = bytes / (1024.0 * 1024.0)
+        return if (mb >= 1024) "%.2f GB".format(mb / 1024.0) else "%.0f MB".format(mb)
+    }
+
+    private fun setDataCapMode(mode: DataUsageTracker.Mode) {
+        settingsSelectedMode = mode
+        val blockSelected = mode == DataUsageTracker.Mode.BLOCK
+        blockModeButton.background = roundedDrawable(if (blockSelected) Theme.accent else Theme.surfaceAlt, radiusDp = 14)
+        blockModeButton.setTextColor(if (blockSelected) Color.BLACK else Theme.textPrimary)
+        notifyModeButton.background = roundedDrawable(if (!blockSelected) Theme.accent else Theme.surfaceAlt, radiusDp = 14)
+        notifyModeButton.setTextColor(if (!blockSelected) Color.BLACK else Theme.textPrimary)
+    }
+
+    private fun refreshSettingsFields() {
+        settingsChannelInput.setText(
+            prefs.getLong("channel_id", 0L).let { if (it != 0L) it.toString() else "" }
+        )
+        settingsTmdbInput.setText(prefs.getString("tmdb_api_key", "") ?: "")
+        settingsGeminiInput.setText(prefs.getString("gemini_api_key", "") ?: "")
+
+        val capBytes = DataUsageTracker.getCapBytes()
+        val capMb = if (capBytes > 0) capBytes / (1024 * 1024) else 0L
+        settingsCapInput.setText(capMb.toString())
+        setDataCapMode(DataUsageTracker.getMode())
+
+        val usedText = formatBytes(DataUsageTracker.getUsedBytes())
+        settingsUsageText.text = if (capBytes > 0) {
+            "$usedText used of ${formatBytes(capBytes)}"
+        } else {
+            "$usedText used · no limit set"
+        }
+    }
+
+    private fun onSaveSettings() {
+        val channelId = settingsChannelInput.text.toString().trim().toLongOrNull()
+        if (channelId == null) {
+            Toast.makeText(this, "Enter a valid channel_id", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val tmdbKey = settingsTmdbInput.text.toString().trim()
+        val geminiKey = settingsGeminiInput.text.toString().trim()
+        val capMb = settingsCapInput.text.toString().trim().toLongOrNull() ?: 0L
+
+        prefs.edit()
+            .putLong("channel_id", channelId)
+            .putString("tmdb_api_key", tmdbKey)
+            .putString("gemini_api_key", geminiKey)
+            .apply()
+
+        TmdbClient.init(tmdbKey)
+        GeminiClient.init(geminiKey)
+        DataUsageTracker.setCapMb(capMb)
+        DataUsageTracker.setMode(settingsSelectedMode)
+        refreshSettingsFields()
+
+        FileLogger.log("Settings saved: channel_id=$channelId tmdbConfigured=${tmdbKey.isNotEmpty()} geminiConfigured=${geminiKey.isNotEmpty()}")
+        Toast.makeText(this, "Saved. Tap Refresh Catalog on Home to apply.", Toast.LENGTH_LONG).show()
     }
 
     private fun orangeButton(label: String, onClick: () -> Unit): Button =
@@ -470,12 +759,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun clearScreen() {
         container.removeAllViews()
-        addShareLogButton()
-    }
-
-    private fun addShareLogButton() {
-        val button = secondaryButton("Share Debug Log") { shareLogFile() }
-        addSpaced(button, topMarginDp = 0)
     }
 
     private fun addText(text: String, size: Float = 16f, muted: Boolean = false, bold: Boolean = false) {

@@ -270,6 +270,24 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
         }
         FileLogger.log("Video requested: chatId=$chatId messageId=$messageId range=${session.headers["range"]}")
 
+        val key = "$chatId:$messageId"
+        if (DataUsageTracker.isBlocked() && !cache.containsKey(key)) {
+            // Never touched this session, so nothing about it is already
+            // downloaded - safe to reject upfront with a clean message
+            // instead of letting the failure surface deep inside a
+            // streaming response. A file that already has SOME bytes
+            // cached this session is deliberately let through here -
+            // ChunkBridge itself still blocks any genuinely NEW range on
+            // it, but replaying/seeking within what's already downloaded
+            // costs no additional data and should keep working.
+            FileLogger.log("Video request blocked - data cap reached: chatId=$chatId messageId=$messageId")
+            return newFixedLengthResponse(
+                Response.Status.FORBIDDEN,
+                "text/plain",
+                "Video data limit reached - raise or reset it in TeleStream's Settings tab"
+            )
+        }
+
         val entry = try {
             getOrResolve(chatId, messageId)
         } catch (e: Exception) {

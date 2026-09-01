@@ -7,6 +7,8 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.StateListDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -17,6 +19,7 @@ import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -38,10 +41,13 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * App-wide look: near-black background, orange accent buttons. Everything
- * here is built with plain Views (no XML layouts, no Compose) to match how
- * the rest of this Activity was already written - see build.gradle.kts,
- * there's no Compose dependency wired up.
+ * App-wide look: near-black background, orange accent. Everything here is
+ * built with plain Views (no XML layouts, no Compose) to match how the rest
+ * of this Activity was already written - see build.gradle.kts, there's no
+ * Compose dependency wired up. Rounded-corner GradientDrawables + consistent
+ * spacing are used throughout instead of flat setBackgroundColor() calls to
+ * give it a less "raw debug screen" look while keeping the exact same
+ * black/orange palette.
  */
 private object Theme {
     val bg = Color.parseColor("#0D0D0D")
@@ -52,6 +58,8 @@ private object Theme {
     val textPrimary = Color.parseColor("#F5F5F5")
     val textMuted = Color.parseColor("#9A9A9A")
     val divider = Color.parseColor("#2E2E2E")
+    val good = Color.parseColor("#4CD964")
+    val bad = Color.parseColor("#FF5A5A")
 }
 
 class MainActivity : AppCompatActivity() {
@@ -73,6 +81,9 @@ class MainActivity : AppCompatActivity() {
     private var logsCollectorJob: Job? = null
 
     private lateinit var createLogDocLauncher: ActivityResultLauncher<String>
+
+    private val density get() = resources.displayMetrics.density
+    private fun dp(value: Int): Int = (value * density).toInt()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -100,6 +111,7 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
+        root.addView(buildHeader())
         root.addView(buildTabBar())
 
         contentFrame = FrameLayout(this).apply {
@@ -114,8 +126,8 @@ class MainActivity : AppCompatActivity() {
         // --- Home tab content (the existing credential/status flow) ---
         container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            val pad = (16 * resources.displayMetrics.density).toInt()
-            setPadding(pad, pad, pad, pad)
+            val padH = dp(16)
+            setPadding(padH, dp(14), padH, dp(24))
         }
         homeScroll = ScrollView(this).apply {
             setBackgroundColor(Theme.bg)
@@ -155,11 +167,90 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ------------------------------------------------------------
+    // Rounded-drawable helpers - everything visual below builds on
+    // these instead of flat setBackgroundColor(), which is what was
+    // making every screen look like an unstyled debug dump.
+    // ------------------------------------------------------------
+
+    private fun roundedDrawable(
+        color: Int,
+        radiusDp: Int = 12,
+        strokeColor: Int? = null,
+        strokeWidthDp: Int = 0
+    ): GradientDrawable = GradientDrawable().apply {
+        shape = GradientDrawable.RECTANGLE
+        cornerRadius = dp(radiusDp).toFloat()
+        setColor(color)
+        if (strokeColor != null && strokeWidthDp > 0) {
+            setStroke(dp(strokeWidthDp), strokeColor)
+        }
+    }
+
+    private fun buttonBackground(baseColor: Int, pressedColor: Int, radiusDp: Int = 14): StateListDrawable =
+        StateListDrawable().apply {
+            addState(intArrayOf(android.R.attr.state_pressed), roundedDrawable(pressedColor, radiusDp))
+            addState(intArrayOf(-android.R.attr.state_enabled), roundedDrawable(Theme.surfaceAlt, radiusDp))
+            addState(intArrayOf(), roundedDrawable(baseColor, radiusDp))
+        }
+
+    /** A padded, rounded surface used to visually group related content instead of a flat page. */
+    private fun card(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        background = roundedDrawable(Theme.surface, radiusDp = 16, strokeColor = Theme.divider, strokeWidthDp = 1)
+        val padH = dp(16)
+        setPadding(padH, dp(14), padH, dp(14))
+    }
+
+    private fun addSpaced(view: View, topMarginDp: Int = 10) {
+        val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        lp.topMargin = dp(topMarginDp)
+        container.addView(view, lp)
+    }
+
+    // ------------------------------------------------------------
+    // Header
+    // ------------------------------------------------------------
+
+    private fun buildHeader(): LinearLayout {
+        val padH = dp(16)
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(Theme.bg)
+            setPadding(padH, dp(16), padH, dp(10))
+
+            val icon = ImageView(this@MainActivity).apply {
+                setImageResource(R.drawable.icon)
+                val size = dp(34)
+                layoutParams = LinearLayout.LayoutParams(size, size)
+            }
+            addView(icon)
+
+            val spacer = View(this@MainActivity)
+            addView(spacer, LinearLayout.LayoutParams(dp(10), 1))
+
+            val textCol = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+            textCol.addView(TextView(this@MainActivity).apply {
+                text = "TeleStream"
+                setTextColor(Theme.textPrimary)
+                textSize = 19f
+                setTypeface(typeface, Typeface.BOLD)
+            })
+            textCol.addView(TextView(this@MainActivity).apply {
+                text = "Telegram → CloudStream bridge"
+                setTextColor(Theme.textMuted)
+                textSize = 12f
+            })
+            addView(textCol)
+        }
+    }
+
+    // ------------------------------------------------------------
     // Tabs
     // ------------------------------------------------------------
 
     private fun buildTabBar(): LinearLayout {
-        val pad = (12 * resources.displayMetrics.density).toInt()
+        val padH = dp(16)
 
         homeTabButton = styledTabButton("Home")
         logsTabButton = styledTabButton("Logs")
@@ -169,14 +260,14 @@ class MainActivity : AppCompatActivity() {
 
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(Theme.surface)
-            setPadding(pad, pad, pad, pad)
+            setBackgroundColor(Theme.bg)
+            setPadding(padH, 0, padH, dp(12))
             addView(
                 homeTabButton,
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             )
             val spacer = View(this@MainActivity)
-            addView(spacer, LinearLayout.LayoutParams((8 * resources.displayMetrics.density).toInt(), 1))
+            addView(spacer, LinearLayout.LayoutParams(dp(8), 1))
             addView(
                 logsTabButton,
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
@@ -188,18 +279,22 @@ class MainActivity : AppCompatActivity() {
         Button(this).apply {
             text = label
             isAllCaps = false
+            textSize = 13f
             setTextColor(Theme.textPrimary)
-            setBackgroundColor(Theme.surfaceAlt)
+            background = roundedDrawable(Theme.surfaceAlt, radiusDp = 20)
+            setPadding(0, dp(10), 0, dp(10))
+            stateListAnimator = null
+            elevation = 0f
         }
 
     private fun selectTab(showLogs: Boolean) {
         homeScroll.visibility = if (showLogs) View.GONE else View.VISIBLE
         logsRoot.visibility = if (showLogs) View.VISIBLE else View.GONE
 
-        homeTabButton.setBackgroundColor(if (showLogs) Theme.surfaceAlt else Theme.accent)
+        homeTabButton.background = roundedDrawable(if (showLogs) Theme.surfaceAlt else Theme.accent, radiusDp = 20)
         homeTabButton.setTextColor(if (showLogs) Theme.textPrimary else Color.BLACK)
 
-        logsTabButton.setBackgroundColor(if (showLogs) Theme.accent else Theme.surfaceAlt)
+        logsTabButton.background = roundedDrawable(if (showLogs) Theme.accent else Theme.surfaceAlt, radiusDp = 20)
         logsTabButton.setTextColor(if (showLogs) Color.BLACK else Theme.textPrimary)
 
         if (showLogs) {
@@ -214,19 +309,25 @@ class MainActivity : AppCompatActivity() {
     // ------------------------------------------------------------
 
     private fun buildLogsTab(): LinearLayout {
-        val pad = (12 * resources.displayMetrics.density).toInt()
+        val padH = dp(16)
 
         logsTextView = TextView(this).apply {
             setTextColor(Theme.textPrimary)
             textSize = 12f
             typeface = Typeface.MONOSPACE
-            setPadding(pad, pad, pad, pad)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
             text = "No logs yet."
+        }
+
+        val logsCard = card().apply {
+            addView(logsTextView)
         }
 
         logsScroll = ScrollView(this).apply {
             setBackgroundColor(Theme.bg)
-            addView(logsTextView)
+            setPadding(padH, 0, padH, dp(12))
+            clipToPadding = false
+            addView(logsCard)
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 0,
@@ -236,8 +337,8 @@ class MainActivity : AppCompatActivity() {
 
         val buttonRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(Theme.surface)
-            setPadding(pad, pad, pad, pad)
+            setBackgroundColor(Theme.bg)
+            setPadding(padH, 0, padH, dp(16))
         }
 
         val clearBtn = orangeButton("Clear") { onClearLogs() }
@@ -248,7 +349,7 @@ class MainActivity : AppCompatActivity() {
         listOf(clearBtn, saveBtn, shareBtn, copyBtn).forEachIndexed { index, btn ->
             val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             if (index > 0) {
-                lp.marginStart = (6 * resources.displayMetrics.density).toInt()
+                lp.marginStart = dp(6)
             }
             buttonRow.addView(btn, lp)
         }
@@ -265,9 +366,27 @@ class MainActivity : AppCompatActivity() {
         Button(this).apply {
             text = label
             isAllCaps = false
-            textSize = 12f
+            textSize = 13f
             setTextColor(Color.BLACK)
-            setBackgroundColor(Theme.accent)
+            background = buttonBackground(Theme.accent, Theme.accentPressedTint)
+            val padH = dp(16)
+            setPadding(padH, dp(12), padH, dp(12))
+            stateListAnimator = null
+            elevation = dp(1).toFloat()
+            setOnClickListener { onClick() }
+        }
+
+    private fun secondaryButton(label: String, onClick: () -> Unit): Button =
+        Button(this).apply {
+            text = label
+            isAllCaps = false
+            textSize = 13f
+            setTextColor(Theme.textPrimary)
+            background = buttonBackground(Theme.surfaceAlt, Theme.divider)
+            val padH = dp(16)
+            setPadding(padH, dp(12), padH, dp(12))
+            stateListAnimator = null
+            elevation = 0f
             setOnClickListener { onClick() }
         }
 
@@ -335,7 +454,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ------------------------------------------------------------
-    // Home tab (unchanged flow, restyled)
+    // Home tab
     // ------------------------------------------------------------
 
     private fun startWatchdog() {
@@ -355,18 +474,29 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun addShareLogButton() {
-        val button = orangeButton("Share Debug Log") { shareLogFile() }
-        container.addView(button)
+        val button = secondaryButton("Share Debug Log") { shareLogFile() }
+        addSpaced(button, topMarginDp = 0)
     }
 
-    private fun addText(text: String, size: Float = 16f) {
-        container.addView(
-            TextView(this).apply {
-                this.text = text
-                textSize = size
-                setTextColor(Theme.textPrimary)
-            }
-        )
+    private fun addText(text: String, size: Float = 16f, muted: Boolean = false, bold: Boolean = false) {
+        val view = TextView(this).apply {
+            this.text = text
+            textSize = size
+            setTextColor(if (muted) Theme.textMuted else Theme.textPrimary)
+            if (bold) setTypeface(typeface, Typeface.BOLD)
+        }
+        addSpaced(view)
+    }
+
+    private fun sectionLabel(text: String) {
+        val view = TextView(this).apply {
+            this.text = text.uppercase()
+            textSize = 12f
+            setTextColor(Theme.accent)
+            setTypeface(typeface, Typeface.BOLD)
+            letterSpacing = 0.06f
+        }
+        addSpaced(view, topMarginDp = 18)
     }
 
     private fun styledEditText(hint: String): EditText =
@@ -374,15 +504,54 @@ class MainActivity : AppCompatActivity() {
             this.hint = hint
             setHintTextColor(Theme.textMuted)
             setTextColor(Theme.textPrimary)
-            setBackgroundColor(Theme.surfaceAlt)
-            val pad = (10 * resources.displayMetrics.density).toInt()
-            setPadding(pad, pad, pad, pad)
+            background = roundedDrawable(Theme.surfaceAlt, radiusDp = 10)
+            val padH = dp(14)
+            setPadding(padH, dp(12), padH, dp(12))
         }
+
+    private fun statusRow(label: String, value: String, isGood: Boolean?) {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val dot = TextView(this).apply {
+            text = "●"
+            textSize = 13f
+            setTextColor(
+                when (isGood) {
+                    true -> Theme.good
+                    false -> Theme.bad
+                    null -> Theme.textMuted
+                }
+            )
+        }
+        row.addView(dot, LinearLayout.LayoutParams(dp(18), ViewGroup.LayoutParams.WRAP_CONTENT))
+        row.addView(TextView(this).apply {
+            text = label
+            setTextColor(Theme.textMuted)
+            textSize = 13f
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(TextView(this).apply {
+            text = value
+            setTextColor(Theme.textPrimary)
+            textSize = 13f
+            setTypeface(typeface, Typeface.BOLD)
+        })
+        container.addView(row, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(6) })
+    }
 
     private fun showApiCredentialsForm() {
         clearScreen()
-        addText("Enter Telegram Credentials", 18f)
+        addText("Enter Telegram Credentials", 18f, bold = true)
+        addText(
+            "These come from my.telegram.org and are only stored locally on this device.",
+            12f, muted = true
+        )
 
+        sectionLabel("Required")
+        val requiredCard = card()
         val idInput = styledEditText("api_id (e.g. 1234567)").apply {
             inputType = InputType.TYPE_CLASS_NUMBER
             prefs.getInt("api_id", 0).let { if (it != 0) setText(it.toString()) }
@@ -393,27 +562,48 @@ class MainActivity : AppCompatActivity() {
         val channelInput = styledEditText("channel_id (e.g. -1001234567890)").apply {
             setText(prefs.getLong("channel_id", 0L).let { if (it != 0L) it.toString() else "" })
         }
-        container.addView(idInput)
-        container.addView(hashInput)
-        container.addView(channelInput)
+        requiredCard.addView(idInput)
+        requiredCard.addView(hashInput, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(10) })
+        requiredCard.addView(channelInput, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(10) })
+        addSpaced(requiredCard, topMarginDp = 8)
 
-        addText("")
-        addText("TMDB API Key (Optional - 32 character key)", 15f)
-        val tmdbInput = styledEditText("tmdb_api_key (v3 auth)").apply {
+        sectionLabel("Optional - metadata enrichment")
+        val optionalCard = card()
+        val tmdbLabel = TextView(this).apply {
+            text = "TMDB API Key (32-character v3 key)"
+            setTextColor(Theme.textMuted)
+            textSize = 12f
+        }
+        val tmdbInput = styledEditText("tmdb_api_key").apply {
             setText(prefs.getString("tmdb_api_key", "") ?: "")
         }
-        container.addView(tmdbInput)
-
-        addText("")
-        addText("Gemini API Key (Optional - AI-assisted catalog matching)", 15f)
+        val geminiLabel = TextView(this).apply {
+            text = "Gemini API Key (AI-assisted catalog matching, optional)"
+            setTextColor(Theme.textMuted)
+            textSize = 12f
+        }
         val geminiInput = styledEditText("gemini_api_key").apply {
             setText(prefs.getString("gemini_api_key", "") ?: "")
         }
-        container.addView(geminiInput)
+        optionalCard.addView(tmdbLabel)
+        optionalCard.addView(tmdbInput, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(6) })
+        optionalCard.addView(geminiLabel, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(14) })
+        optionalCard.addView(geminiInput, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(6) })
+        addSpaced(optionalCard, topMarginDp = 8)
         addText(
-            "Only used as a fallback when TMDB can't find a movie match on its own - " +
+            "Gemini is only used as a fallback when TMDB can't find a movie match on its own - " +
                 "leave blank to disable.",
-            12f
+            12f, muted = true
         )
 
         val saveButton = orangeButton("Save & Continue") {
@@ -451,7 +641,7 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Startup error: ${t.message}", Toast.LENGTH_LONG).show()
             }
         }
-        container.addView(saveButton)
+        addSpaced(saveButton, topMarginDp = 20)
     }
 
     private fun observeAuthState() {
@@ -474,12 +664,13 @@ class MainActivity : AppCompatActivity() {
                     is AuthState.Ready -> showMainScreen()
                     is AuthState.Error -> {
                         clearScreen()
-                        addText("Error: ${state.message}", 18f)
+                        addText("Error", 18f, bold = true)
+                        addText(state.message, 13f, muted = true)
                         val retryButton = orangeButton("Start Over") {
                             prefs.edit().clear().apply()
                             recreate()
                         }
-                        container.addView(retryButton)
+                        addSpaced(retryButton, topMarginDp = 16)
                     }
                 }
             }
@@ -488,22 +679,33 @@ class MainActivity : AppCompatActivity() {
 
     private fun showLoginInput(label: String, onSubmit: (String) -> Unit) {
         clearScreen()
-        addText(label)
+        addText(label, 18f, bold = true)
         val input = styledEditText("")
-        container.addView(input)
+        addSpaced(input)
         val button = orangeButton("Submit") {
             val text = input.text.toString().trim()
             if (text.isNotEmpty()) onSubmit(text)
         }
-        container.addView(button)
+        addSpaced(button, topMarginDp = 14)
     }
 
     private fun showMainScreen() {
         clearScreen()
-        addText("Telegram Status: Connected", 18f)
-        addText("Local Server: ${if (StreamService.isRunning) "Running on port ${StreamService.PORT}" else "Stopped"}")
-        addText("TMDB Enriched: ${if (TmdbClient.isConfigured()) "Enabled" else "Disabled"}")
-        addText("Gemini Assist: ${if (GeminiClient.isConfigured()) "Enabled" else "Disabled"}")
+        addText("Status", 18f, bold = true)
+
+        val statusCard = card()
+        val savedContainer = container
+        container = statusCard
+        statusRow("Telegram", "Connected", true)
+        statusRow(
+            "Local Server",
+            if (StreamService.isRunning) "Running on port ${StreamService.PORT}" else "Stopped",
+            StreamService.isRunning
+        )
+        statusRow("TMDB Enriched", if (TmdbClient.isConfigured()) "Enabled" else "Disabled", TmdbClient.isConfigured())
+        statusRow("Gemini Assist", if (GeminiClient.isConfigured()) "Enabled" else "Disabled", GeminiClient.isConfigured())
+        container = savedContainer
+        addSpaced(statusCard, topMarginDp = 8)
 
         val toggleButton = orangeButton(
             if (StreamService.isRunning) "Stop Server" else "Start Server"
@@ -516,18 +718,19 @@ class MainActivity : AppCompatActivity() {
             }
             container.postDelayed({ showMainScreen() }, 1000)
         }
-        container.addView(toggleButton)
+        addSpaced(toggleButton, topMarginDp = 18)
 
+        sectionLabel("Catalog")
         val fetchButton = orangeButton("Refresh Catalog") { fetchAndShowCatalog(fullRebuild = false) }
-        container.addView(fetchButton)
+        addSpaced(fetchButton, topMarginDp = 8)
 
-        val fullRebuildButton = orangeButton("Full Rebuild (Slow)") { fetchAndShowCatalog(fullRebuild = true) }
-        container.addView(fullRebuildButton)
+        val fullRebuildButton = secondaryButton("Full Rebuild (Slow)") { fetchAndShowCatalog(fullRebuild = true) }
+        addSpaced(fullRebuildButton)
         addText(
             "Refresh Catalog = fast incremental sync (only new files since last time). " +
                 "Full Rebuild = re-scans everything and re-spends every TMDB/Gemini lookup - " +
                 "only use it if something looks wrong or you renamed/edited files already synced before.",
-            12f
+            12f, muted = true
         )
     }
 
@@ -539,25 +742,34 @@ class MainActivity : AppCompatActivity() {
                     "Full rebuild: re-scanning everything from Telegram & TMDB/Gemini..."
                 } else {
                     "Syncing catalog (new files only)..."
-                }
+                },
+                13f, muted = true
             )
             val items = try {
                 withContext(Dispatchers.IO) {
                     CatalogRepository.fetchCatalog(localBaseUrl, channelId, forceRefresh = true, fullRebuild = fullRebuild)
                 }
             } catch (e: Exception) {
-                addText("Catalog error: ${e.message}")
+                addText("Catalog error: ${e.message}", 13f, muted = true)
                 return@launch
             }
-            items.forEach { item ->
+
+            sectionLabel("${items.size} item(s)")
+            val resultsCard = card()
+            items.forEachIndexed { index, item ->
                 val row = TextView(this@MainActivity).apply {
-                    text = "${item.title} (${item.year ?: "N/A"}) [${item.type.uppercase()}]" +
-                            (item.imdbId?.let { " - IMDb: $it" } ?: "")
+                    text = "${item.title} (${item.year ?: "N/A"}) · ${item.type.uppercase()}" +
+                            (item.imdbId?.let { " · IMDb: $it" } ?: "")
                     setTextColor(Theme.textPrimary)
-                    setPadding(0, 16, 0, 16)
+                    textSize = 13f
                 }
-                container.addView(row)
+                val lp = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+                if (index > 0) lp.topMargin = dp(8)
+                resultsCard.addView(row, lp)
             }
+            addSpaced(resultsCard, topMarginDp = 8)
         }
     }
 }

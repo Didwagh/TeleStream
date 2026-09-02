@@ -757,6 +757,27 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * A real "start over" - not just recreate(). TelegramClient is a
+     * process-lifetime singleton whose init() is deliberately idempotent
+     * (if client != null, it no-ops), so simply restarting the Activity
+     * leaves the old, already-broken TDLib client and its stale authState
+     * sitting there untouched - you'd land right back on the same error.
+     * TDLib's own on-disk session can also carry over a bad auth attempt.
+     * The only reliable fix is a genuinely fresh process AND a fresh TDLib
+     * database - which is also why clearing the app's storage manually
+     * was the only thing that actually worked before this.
+     */
+    private fun restartAppCleanly() {
+        runCatching { File(filesDir, "tdlib").deleteRecursively() }
+        runCatching { File(cacheDir, "tdlib_files").deleteRecursively() }
+
+        val restartIntent = packageManager.getLaunchIntentForPackage(packageName)
+        restartIntent?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        startActivity(restartIntent)
+        Runtime.getRuntime().exit(0)
+    }
+
     private fun clearScreen() {
         container.removeAllViews()
     }
@@ -951,7 +972,7 @@ class MainActivity : AppCompatActivity() {
                         addText(state.message, 13f, muted = true)
                         val retryButton = orangeButton("Start Over") {
                             prefs.edit().clear().apply()
-                            recreate()
+                            restartAppCleanly()
                         }
                         addSpaced(retryButton, topMarginDp = 16)
                     }

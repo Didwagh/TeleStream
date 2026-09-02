@@ -44,6 +44,22 @@ class ChunkBridge(
     private val fetchedLock = Any()
     private val readaheadScope = CoroutineScope(Dispatchers.IO)
 
+    // Tracks how much of THIS file we've already charged against the data
+    // cap, based on TDLib's own authoritative downloadedPrefixSize - not
+    // the requested `limit` of any single call. Multiple concurrent
+    // ensureDownloaded() calls (warmup + prefetch + readahead can all be
+    // in flight for the same file at once) each used to count their own
+    // full `limit` as "used", even when most or all of those bytes were
+    // already on disk from another call moments earlier. That's what was
+    // blowing through a 1GB cap in ~2 seconds - it was mostly the SAME
+    // bytes being counted 2-3x over, not a real 1GB transfer. Diffing
+    // against this shared, monotonically-updated baseline means only
+    // genuinely new bytes ever get charged, no matter how many concurrent
+    // callers are waiting on the same file.
+    private val usageLock = Any()
+    @Volatile
+    private var lastAccountedBytes: Long = 0L
+
     @Volatile
     private var hasDownloadedAnything = false
 
@@ -126,7 +142,19 @@ class ChunkBridge(
                         val covered = downloadedTo >= (offset + limit) || f.local.isDownloadingCompleted
                         if (covered && cont.isActive) {
                             synchronized(fetchedLock) { fetchedRanges.add(offset..(offset + limit)) }
-                            DataUsageTracker.addVideoBytes(limit)
+
+                            // Charge only the genuinely NEW bytes TDLib
+                            // now reports as downloaded, not this call's
+                            // requested `limit` - see field comment above.
+                            val totalDownloaded = f.local.downloadedPrefixSize.toLong()
+                            synchronized(usageLock) {
+                                val newBytes = totalDownloaded - lastAccountedBytes
+                                if (newBytes > 0) {
+                                    DataUsageTracker.addVideoBytes(newBytes)
+                                    lastAccountedBytes = totalDownloaded
+                                }
+                            }
+
                             TelegramClient.removeFileListener(fileId, listener)
                             cont.resume(Unit)
                         }

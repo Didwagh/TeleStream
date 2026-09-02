@@ -94,6 +94,7 @@ class MainActivity : AppCompatActivity() {
         FileLogger.init(applicationContext)
         ChannelCatalogBuilder.init(applicationContext)
         DataUsageTracker.init(applicationContext)
+        LocalStorageManager.init(applicationContext)
         prefs = getSharedPreferences("tgserver_prefs", MODE_PRIVATE)
 
         if (Build.VERSION.SDK_INT >= 33) {
@@ -395,6 +396,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var settingsGeminiInput: EditText
     private lateinit var settingsCapInput: EditText
     private lateinit var settingsUsageText: TextView
+    private lateinit var settingsStorageCapInput: EditText
+    private lateinit var settingsStorageUsageText: TextView
     private lateinit var blockModeButton: Button
     private lateinit var notifyModeButton: Button
     private var settingsSelectedMode: DataUsageTracker.Mode = DataUsageTracker.Mode.BLOCK
@@ -507,6 +510,33 @@ class MainActivity : AppCompatActivity() {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ).also { it.topMargin = dp(10) })
 
+        val freeSpaceButton = secondaryButton("Free Up Space (clear downloaded video cache)") {
+            Toast.makeText(this, "Freeing up space...", Toast.LENGTH_SHORT).show()
+            TelegramClient.optimizeStorage { bytesFreed, filesDeleted ->
+                runOnUiThread {
+                    Toast.makeText(
+                        this,
+                        "Freed ${formatBytes(bytesFreed)} across $filesDeleted file(s)",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+        dataCard.addView(freeSpaceButton, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(8) })
+
+        val freeSpaceNote = TextView(this).apply {
+            text = "This deletes downloaded video bytes sitting on disk to reclaim storage - it doesn't " +
+                "touch the usage counter above, which tracks network data over time, not current disk " +
+                "space. Your Telegram login and catalog aren't affected."
+            textSize = 11f
+            setTextColor(Theme.textMuted)
+        }
+        dataCard.addView(freeSpaceNote, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(6) })
+
         val capLabel = TextView(this).apply {
             text = "Cap (MB, 0 = unlimited)"
             setTextColor(Theme.textMuted)
@@ -569,6 +599,84 @@ class MainActivity : AppCompatActivity() {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ).also { it.topMargin = dp(8) })
 
+        val storageLabel = TextView(this).apply {
+            text = "LOCAL STORAGE"
+            textSize = 12f
+            setTextColor(Theme.accent)
+            setTypeface(typeface, Typeface.BOLD)
+            letterSpacing = 0.06f
+        }
+        col.addView(storageLabel, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(18) })
+
+        val storageCard = card()
+
+        settingsStorageUsageText = TextView(this).apply {
+            text = "Checking..."
+            textSize = 14f
+            setTextColor(Theme.textPrimary)
+            setTypeface(typeface, Typeface.BOLD)
+        }
+        storageCard.addView(settingsStorageUsageText)
+
+        val freeUpButton = secondaryButton("Free Up Space Now") {
+            LocalStorageManager.enforceNow()
+            Toast.makeText(this, "Cleanup started - checking back in a few seconds", Toast.LENGTH_SHORT).show()
+            lifecycleScope.launch {
+                delay(4000)
+                refreshLocalStorageUsageDisplay()
+            }
+        }
+        storageCard.addView(freeUpButton, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(10) })
+
+        val storageCapLabel = TextView(this).apply {
+            text = "Cap (MB) - downloaded video chunks get cleaned up above this"
+            setTextColor(Theme.textMuted)
+            textSize = 12f
+        }
+        storageCard.addView(storageCapLabel, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(16) })
+
+        settingsStorageCapInput = styledEditText("1536").apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        storageCard.addView(settingsStorageCapInput, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(6) })
+
+        val storagePresetsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        listOf("500 MB" to 500L, "1 GB" to 1024L, "1.5 GB" to 1536L, "2 GB" to 2048L, "4 GB" to 4096L)
+            .forEachIndexed { index, (label, mb) ->
+                val btn = secondaryButton(label) { settingsStorageCapInput.setText(mb.toString()) }
+                btn.textSize = 11f
+                val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                if (index > 0) lp.marginStart = dp(6)
+                storagePresetsRow.addView(btn, lp)
+            }
+        storageCard.addView(storagePresetsRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(8) })
+
+        col.addView(storageCard, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(8) })
+
+        val storageNote = TextView(this).apply {
+            text = "Cleaned up automatically every 10 minutes while the server is running, and once right " +
+                "when it starts - using Telegram's own storage optimizer, which removes least-recently-used " +
+                "files first and never touches anything downloaded in the last minute, so nothing mid-playback " +
+                "gets pulled out from under you."
+            textSize = 12f
+            setTextColor(Theme.textMuted)
+        }
+        col.addView(storageNote, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(8) })
+
         val saveButton = orangeButton("Save Settings") { onSaveSettings() }
         col.addView(saveButton, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
@@ -623,6 +731,22 @@ class MainActivity : AppCompatActivity() {
         } else {
             "$usedText used · no limit set"
         }
+
+        settingsStorageCapInput.setText((LocalStorageManager.getCapBytes() / (1024 * 1024)).toString())
+        refreshLocalStorageUsageDisplay()
+    }
+
+    private fun refreshLocalStorageUsageDisplay() {
+        settingsStorageUsageText.text = "Checking..."
+        lifecycleScope.launch {
+            val used = try {
+                withContext(Dispatchers.IO) { LocalStorageManager.getCurrentUsageBytes() }
+            } catch (e: Exception) {
+                settingsStorageUsageText.text = "Couldn't read usage: ${e.message}"
+                return@launch
+            }
+            settingsStorageUsageText.text = "${formatBytes(used)} of downloaded video cached on disk"
+        }
     }
 
     private fun onSaveSettings() {
@@ -634,6 +758,7 @@ class MainActivity : AppCompatActivity() {
         val tmdbKey = settingsTmdbInput.text.toString().trim()
         val geminiKey = settingsGeminiInput.text.toString().trim()
         val capMb = settingsCapInput.text.toString().trim().toLongOrNull() ?: 0L
+        val storageCapMb = settingsStorageCapInput.text.toString().trim().toLongOrNull() ?: 0L
 
         prefs.edit()
             .putLong("channel_id", channelId)
@@ -645,6 +770,8 @@ class MainActivity : AppCompatActivity() {
         GeminiClient.init(geminiKey)
         DataUsageTracker.setCapMb(capMb)
         DataUsageTracker.setMode(settingsSelectedMode)
+        LocalStorageManager.setCapMb(storageCapMb)
+        LocalStorageManager.enforceNow()
         refreshSettingsFields()
 
         FileLogger.log("Settings saved: channel_id=$channelId tmdbConfigured=${tmdbKey.isNotEmpty()} geminiConfigured=${geminiKey.isNotEmpty()}")

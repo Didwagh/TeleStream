@@ -36,9 +36,21 @@ import kotlin.coroutines.resume
 class ChunkBridge(
     private val fileId: Int,
     private val fileSize: Long,
-    private val steadyChunkSize: Long = 4L * 1024 * 1024,
+    private val steadyChunkSize: Long = 3L * 1024 * 1024,
     private val firstChunkSize: Long = 512L * 1024
 ) {
+    companion object {
+        // Caps how many speculative (warmup/prefetch) downloads run at
+        // once, across ALL files - CloudStream can fire /warmup for
+        // several catalog items in a burst just from you viewing their
+        // info pages (see the logs this was diagnosed from: 3-4 warmups
+        // within milliseconds of each other, for files you never actually
+        // played). Real playback reads are never gated by this - only the
+        // speculative "just in case" downloads queue behind it, which
+        // matters most on a low-end device with limited RAM/storage/CPU.
+        private val speculativeSlots = kotlinx.coroutines.sync.Semaphore(2)
+    }
+
     private var filePath: String? = null
     private val fetchedRanges = mutableListOf<LongRange>()
     private val fetchedLock = Any()
@@ -63,6 +75,12 @@ class ChunkBridge(
     @Volatile
     private var hasDownloadedAnything = false
 
+    // End offset (exclusive) of the last chunk this ChunkBridge served,
+    // used to tell genuine sequential playback apart from a seek/probe -
+    // see the readahead-gating comment in read() below.
+    @Volatile
+    private var lastChunkEnd: Long = -1L
+
     suspend fun read(position: Long, length: Long): ByteArray {
         val effectiveChunkSize = if (hasDownloadedAnything) steadyChunkSize else firstChunkSize
 
@@ -79,7 +97,23 @@ class ChunkBridge(
         // Fire-and-forget: start pulling the next chunk in the background
         // now that this one is ready, so sequential playback rarely has to
         // wait on a chunk boundary. Never awaited, never blocks this call.
-        if (chunkEndExclusive < fileSize) {
+        //
+        // Only do this when this read picks up exactly where the last one
+        // left off (or this is the very first read for this file) - i.e.
+        // it actually looks like sequential playback. A read that jumps to
+        // a new position - a real seek, or one of several probe reads a
+        // player fires at scattered offsets before real playback even
+        // starts (very visible in the logs this was diagnosed from: a
+        // burst of unrelated Range requests within milliseconds of each
+        // other, across a multi-GB file) - is not a signal that the NEXT
+        // chunk after this one is about to be needed too. Readahead used
+        // to fire unconditionally on every single read regardless of
+        // whether it was actually sequential, so each of those scattered
+        // probe/seek reads kicked off its own speculative 3-4MB download
+        // that usually never got revisited - that's what was silently
+        // filling up the on-disk cache from a single small test file.
+        val isSequentialContinuation = lastChunkEnd < 0 || chunkStart == lastChunkEnd
+        if (chunkEndExclusive < fileSize && isSequentialContinuation) {
             val nextLen = minOf(steadyChunkSize, fileSize - chunkEndExclusive)
             readaheadScope.launch {
                 try {
@@ -89,6 +123,7 @@ class ChunkBridge(
                 }
             }
         }
+        lastChunkEnd = chunkEndExclusive
 
         val path = filePath ?: error("No local file path after download completed")
         val raf = RandomAccessFile(path, "r")
@@ -104,16 +139,24 @@ class ChunkBridge(
 
     /**
      * Kicks off a download for a specific range without waiting for it or
-     * returning any bytes - used by /prefetch to get a head start before
-     * the player even requests anything.
+     * returning any bytes - used by /warmup and /prefetch to get a head
+     * start before the player even requests anything.
+     *
+     * Gated by speculativeSlots: this is a "might be needed soon" bet, not
+     * a confirmed need, so it queues behind a small cap instead of running
+     * unbounded - CloudStream can fire several of these in a burst just
+     * from you scrolling past catalog items.
      */
     fun prefetchInBackground(offset: Long, length: Long) {
         readaheadScope.launch {
+            speculativeSlots.acquire()
             try {
                 ensureDownloaded(offset, length)
                 FileLogger.log("Prefetch complete for fileId=$fileId offset=$offset length=$length")
             } catch (e: Exception) {
                 FileLogger.error("Prefetch failed for fileId=$fileId offset=$offset", e)
+            } finally {
+                speculativeSlots.release()
             }
         }
     }
@@ -157,6 +200,24 @@ class ChunkBridge(
 
                             TelegramClient.removeFileListener(fileId, listener)
                             cont.resume(Unit)
+
+                            // Tell TDLib to actually stop here. Despite
+                            // the `limit` parameter on DownloadFile,
+                            // observed behavior is that TDLib keeps
+                            // pulling a file in the background well past
+                            // the requested range once a download has
+                            // been kicked off for it - which is how
+                            // touching a handful of multi-GB files via
+                            // /warmup (never even pressing Play) ran up
+                            // several GB of storage. Explicitly cancelling
+                            // once OUR specific request is satisfied is
+                            // what actually enforces the small-chunk
+                            // contract; the next read()/readahead/prefetch
+                            // call simply issues a fresh DownloadFile for
+                            // whatever it needs next, same as always.
+                            if (!f.local.isDownloadingCompleted) {
+                                client.send(TdApi.CancelDownloadFile(fileId, false)) { }
+                            }
                         }
                     }
                     TelegramClient.addFileListener(fileId, listener)

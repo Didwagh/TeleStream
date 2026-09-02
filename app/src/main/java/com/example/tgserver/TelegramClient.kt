@@ -66,6 +66,64 @@ object TelegramClient {
 
     fun rawClient(): Client = client ?: throw IllegalStateException("TelegramClient not initialized")
 
+    /**
+     * Fast, approximate total size of everything TDLib has downloaded to
+     * disk (video chunks, mostly, for this app). Safe to call often - it's
+     * documented as a quick estimate, not a full chat-by-chat walk.
+     */
+    suspend fun getStorageUsageBytes(): Long {
+        val c = client ?: return 0L
+        return suspendCancellableCoroutine { cont ->
+            c.send(TdApi.GetStorageStatisticsFast()) { result ->
+                if (result is TdApi.StorageStatisticsFast) {
+                    cont.resume(result.filesSize)
+                } else {
+                    cont.resume(0L)
+                }
+            }
+        }
+    }
+
+    /**
+     * Asks TDLib to delete files (least-recently-used first, per its own
+     * internal accounting) until total size is back under [maxTotalBytes].
+     * This goes through TDLib rather than deleting files directly, since
+     * TDLib keeps its own database of what's on disk - removing files out
+     * from under it would leave that bookkeeping inconsistent and could
+     * cause confusing failures later.
+     *
+     * immunityDelay=60 protects anything downloaded in the last 60
+     * seconds, so a file that's actively mid-download or just started
+     * playing can't get evicted out from under itself.
+     */
+    fun optimizeStorage(maxTotalBytes: Long) {
+        val c = client ?: return
+        val request = TdApi.OptimizeStorage(
+            maxTotalBytes,
+            -1,
+            -1,
+            60,
+            emptyArray(),
+            LongArray(0),
+            LongArray(0),
+            false,
+            0
+        )
+        c.send(request) { result ->
+            when (result) {
+                is TdApi.StorageStatistics -> {
+                    FileLogger.log(
+                        "optimizeStorage: now using ${result.size} byte(s) across ${result.count} file(s)"
+                    )
+                }
+                is TdApi.Error -> {
+                    FileLogger.error("optimizeStorage failed: ${result.message}")
+                }
+                else -> {}
+            }
+        }
+    }
+
     fun init(context: Context, apiId: Int, apiHash: String) {
         if (client != null) return
 
@@ -189,6 +247,38 @@ object TelegramClient {
     fun submitPassword(password: String) {
         sendSafe(TdApi.CheckAuthenticationPassword(password)) { res ->
             if (res is TdApi.Error) authState.value = AuthState.Error(res.message)
+        }
+    }
+
+    /**
+     * Reclaims disk space TDLib has used for downloaded files. Passing
+     * size=0 (keep at most 0 bytes) plus immunityDelay=0 (no grace period
+     * for recently-touched files) tells TDLib to delete everything it can
+     * right now, not just stale old files - this is meant to be a manual
+     * "empty the cache" action, the same intent as clearing an app's
+     * cache in Android's own storage settings, just without also wiping
+     * the Telegram login/database.
+     */
+    fun optimizeStorage(onDone: (bytesFreed: Long, filesDeleted: Int) -> Unit) {
+        sendSafe(
+            TdApi.OptimizeStorage(
+                0L,
+                0,
+                0,
+                0,
+                emptyArray<TdApi.FileType>(),
+                LongArray(0),
+                LongArray(0),
+                true,
+                0
+            )
+        ) { res ->
+            if (res is TdApi.StorageStatistics) {
+                onDone(res.size, res.count)
+            } else {
+                FileLogger.error("optimizeStorage unexpected result: $res", RuntimeException("$res"))
+                onDone(0L, 0)
+            }
         }
     }
 

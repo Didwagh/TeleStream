@@ -98,6 +98,15 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
      * Fixed by routing through the same getOrResolve()/ChunkBridge that
      * /prefetch and /video use, so the bytes this warms up are the exact
      * same ones /video will ask for - nothing wasted, nothing orphaned.
+     *
+     * Head-only, deliberately: this fires every time a movie's info page
+     * opens while browsing, not just when you actually intend to watch it.
+     * The old version also grabbed the last ~2MB (in case the MP4 index
+     * sits at the end) on every single one of those - which almost always
+     * timed out anyway (see the repeated 30s-timeout entries in the logs)
+     * and, on the rare file where it didn't, cached 2MB of a file you may
+     * have just been glancing at and never actually opened. /prefetch is
+     * head-only too now, for the same reason.
      */
     private fun serveWarmup(session: IHTTPSession): Response {
         val chatId = session.parameters["chat_id"]?.firstOrNull()?.toLongOrNull()
@@ -106,7 +115,7 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
             return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "missing chat_id/message_id")
         }
         FileLogger.log("Warmup requested: chatId=$chatId messageId=$messageId")
-        startHeadTailPrefetch(chatId, messageId)
+        startHeadPrefetch(chatId, messageId)
         return newFixedLengthResponse(Response.Status.OK, "text/plain", "OK")
     }
 
@@ -152,12 +161,13 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
 
     /**
      * GET /prefetch?chat_id=X&message_id=Y
-     * Called from the CloudStream plugin's load() (movie detail screen) to
-     * get a head start before the user actually taps Play. Grabs the first
-     * and last ~2MB in the background - the start for immediate playback,
-     * the end in case this file's MP4 index (moov atom) sits at the end
-     * rather than the start. Always returns immediately; never blocks the
-     * caller, since load() shouldn't be slowed down by this.
+     * Not currently called by the CloudStream plugin (only /warmup is) -
+     * kept as a standalone endpoint for manual testing / future use.
+     * Head-only, same reasoning as /warmup: a tail-fetch on a multi-GB
+     * file that hasn't been touched yet is a slow, unreliable random seek
+     * (see the repeated 30s timeouts in the logs this was diagnosed from)
+     * for content that may never even get watched. Always returns
+     * immediately; never blocks the caller.
      */
     private fun servePrefetch(session: IHTTPSession): Response {
         val chatId = session.parameters["chat_id"]?.firstOrNull()?.toLongOrNull()
@@ -166,7 +176,7 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
             return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "missing chat_id/message_id")
         }
 
-        startHeadTailPrefetch(chatId, messageId)
+        startHeadPrefetch(chatId, messageId)
 
         // Ack immediately - the actual downloading happens in the
         // background via the coroutine launched above, not before this
@@ -177,27 +187,21 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
     /**
      * Shared by /warmup and /prefetch: resolves the file (or reuses the
      * ChunkBridge already cached for it) and kicks off a background
-     * download of the first ~2MB (for immediate playback start) and the
-     * last ~2MB (in case this file's MP4 index/moov atom sits at the end
-     * rather than the start). Never blocks the caller - the actual
-     * downloading happens on the coroutine launched here, via the same
-     * ChunkBridge instance /video will read from, so none of this work is
-     * wasted or orphaned regardless of which endpoint(s) called it or how
-     * many times.
+     * download of the first ~2MB, via the same ChunkBridge instance
+     * /video will read from - so none of this work is wasted or orphaned
+     * regardless of which endpoint(s) called it or how many times.
+     * ChunkBridge itself now cancels the TDLib download once this small
+     * range is actually satisfied, so this can never balloon into
+     * downloading the rest of the file in the background - see the
+     * cancel-after-satisfied comment in ChunkBridge.ensureDownloaded().
      */
-    private fun startHeadTailPrefetch(chatId: Long, messageId: Long) {
+    private fun startHeadPrefetch(chatId: Long, messageId: Long) {
         serverScope.launch {
             try {
                 val entry = getOrResolve(chatId, messageId)
                 val prefetchSize = 2L * 1024 * 1024
-                FileLogger.log("Prefetch starting for chatId=$chatId messageId=$messageId (fileSize=${entry.fileSize})")
-
+                FileLogger.log("Prefetch (head-only) starting for chatId=$chatId messageId=$messageId (fileSize=${entry.fileSize})")
                 entry.bridge.prefetchInBackground(0, minOf(prefetchSize, entry.fileSize))
-
-                if (entry.fileSize > prefetchSize) {
-                    val tailStart = maxOf(0, entry.fileSize - prefetchSize)
-                    entry.bridge.prefetchInBackground(tailStart, entry.fileSize - tailStart)
-                }
             } catch (e: Exception) {
                 FileLogger.error("Prefetch resolve failed for chatId=$chatId messageId=$messageId", e)
             }

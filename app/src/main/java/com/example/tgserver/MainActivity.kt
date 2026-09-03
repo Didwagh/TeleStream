@@ -670,11 +670,12 @@ class MainActivity : AppCompatActivity() {
         }
         bootCard.addView(bootDesc)
 
-        val toggleBootBtn = secondaryButton(if (isAutoStart) "Disable Auto-Start on Boot" else "Enable Auto-Start on Boot") {
+        lateinit var toggleBootBtn: Button
+        toggleBootBtn = secondaryButton(if (isAutoStart) "Disable Auto-Start on Boot" else "Enable Auto-Start on Boot") {
             isAutoStart = !isAutoStart
             prefs.edit().putBoolean("pref_auto_start_on_boot", isAutoStart).apply()
             bootDesc.text = if (isAutoStart) "Auto-Start on Boot: ENABLED\nServer starts automatically after device reboot" else "Auto-Start on Boot: DISABLED\nServer only runs when started manually"
-            (it as? Button)?.text = if (isAutoStart) "Disable Auto-Start on Boot" else "Enable Auto-Start on Boot"
+            toggleBootBtn.text = if (isAutoStart) "Disable Auto-Start on Boot" else "Enable Auto-Start on Boot"
             Toast.makeText(this, if (isAutoStart) "Auto-start on boot enabled" else "Auto-start on boot disabled", Toast.LENGTH_SHORT).show()
         }
         bootCard.addView(toggleBootBtn, LinearLayout.LayoutParams(

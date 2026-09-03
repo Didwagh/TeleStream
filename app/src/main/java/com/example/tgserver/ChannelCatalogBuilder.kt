@@ -50,6 +50,14 @@ data class ChannelItem(
     val cast: List<String> = emptyList()
 )
 
+data class CatalogStats(
+    val movieCount: Int,
+    val seriesCount: Int,
+    val episodeCount: Int,
+    val totalSizeBytes: Long,
+    val lastSyncTimestamp: Long
+)
+
 /**
  * Builds and maintains the movie/series catalog for a Telegram channel.
  *
@@ -101,6 +109,8 @@ object ChannelCatalogBuilder {
 
     private var cachedChatId: Long? = null
 
+    private var cachedLastSyncTimestamp: Long = 0L
+
     private val buildLock = Mutex()
 
     @Volatile
@@ -108,6 +118,33 @@ object ChannelCatalogBuilder {
 
     fun peekCache(chatId: Long): List<ChannelItem>? {
         return if (cachedChatId == chatId) cache else null
+    }
+
+    fun getLastSyncTimestamp(): Long = cachedLastSyncTimestamp
+
+    fun getCatalogStats(chatId: Long): CatalogStats? {
+        val items = if (cachedChatId == chatId && cache != null) {
+            cache
+        } else {
+            val persisted = loadPersisted(chatId) ?: return null
+            cache = persisted.items
+            cachedChatId = chatId
+            cachedLastSyncTimestamp = persisted.lastSyncTimestamp
+            persisted.items
+        } ?: return null
+
+        val movies = items.filter { it.type == ItemType.MOVIE }
+        val series = items.filter { it.type == ItemType.SERIES }
+        val totalMovieSize = movies.sumOf { it.totalSize }
+        val totalSeriesSize = series.sumOf { s -> s.episodes.sumOf { it.totalSize } }
+        val totalEpisodes = series.sumOf { it.episodes.size }
+        return CatalogStats(
+            movieCount = movies.size,
+            seriesCount = series.size,
+            episodeCount = totalEpisodes,
+            totalSizeBytes = totalMovieSize + totalSeriesSize,
+            lastSyncTimestamp = cachedLastSyncTimestamp
+        )
     }
 
     fun isCurrentlyBuilding(): Boolean =
@@ -160,6 +197,7 @@ object ChannelCatalogBuilder {
                 if ((cachedChatId != chatId || cache == null) && persisted != null) {
                     cache = persisted.items
                     cachedChatId = chatId
+                    cachedLastSyncTimestamp = persisted.lastSyncTimestamp
                     FileLogger.log(
                         "ChannelCatalogBuilder: warm-started from disk cache for chatId=$chatId (${persisted.items.size} item(s))"
                     )
@@ -169,6 +207,7 @@ object ChannelCatalogBuilder {
 
                 cache = synced.items
                 cachedChatId = chatId
+                cachedLastSyncTimestamp = synced.lastSyncTimestamp
 
                 savePersisted(chatId, synced)
 
@@ -419,7 +458,8 @@ object ChannelCatalogBuilder {
 
     private data class PersistedCatalog(
         val lastMessageId: Long,
-        val items: List<ChannelItem>
+        val items: List<ChannelItem>,
+        val lastSyncTimestamp: Long = System.currentTimeMillis()
     )
 
     private fun cacheFile(chatId: Long): File? {
@@ -433,13 +473,14 @@ object ChannelCatalogBuilder {
         return try {
             val obj = JSONObject(file.readText())
             val lastMessageId = obj.optLong("last_message_id", 0L)
+            val lastSyncTimestamp = obj.optLong("last_sync_timestamp", file.lastModified())
             val itemsArr = obj.optJSONArray("items") ?: JSONArray()
             val items = (0 until itemsArr.length()).mapNotNull { itemFromJson(itemsArr.optJSONObject(it)) }
             FileLogger.log(
                 "ChannelCatalogBuilder: loaded persisted cache for chatId=$chatId " +
-                    "(${items.size} item(s), lastMessageId=$lastMessageId)"
+                    "(${items.size} item(s), lastMessageId=$lastMessageId, lastSync=$lastSyncTimestamp)"
             )
-            PersistedCatalog(lastMessageId, items)
+            PersistedCatalog(lastMessageId, items, lastSyncTimestamp)
         } catch (e: Exception) {
             FileLogger.error("ChannelCatalogBuilder: failed to load persisted cache for chatId=$chatId, starting fresh", e)
             null
@@ -451,6 +492,7 @@ object ChannelCatalogBuilder {
         try {
             val obj = JSONObject()
             obj.put("last_message_id", catalog.lastMessageId)
+            obj.put("last_sync_timestamp", catalog.lastSyncTimestamp)
             val arr = JSONArray()
             catalog.items.forEach { arr.put(itemToJson(it)) }
             obj.put("items", arr)
@@ -714,7 +756,8 @@ object ChannelCatalogBuilder {
 
         return PersistedCatalog(
             lastMessageId = newHighWaterMark,
-            items = mergedItems
+            items = mergedItems,
+            lastSyncTimestamp = System.currentTimeMillis()
         )
     }
 
@@ -736,7 +779,11 @@ object ChannelCatalogBuilder {
     ): List<ChannelItem> {
 
         if (newLeaves.isEmpty()) {
-            return existingItems
+            return existingItems.sortedByDescending { item ->
+                val movieMaxMsg = item.parts.maxOfOrNull { it.messageId } ?: 0L
+                val seriesMaxMsg = item.episodes.flatMap { it.parts }.maxOfOrNull { it.messageId } ?: 0L
+                maxOf(movieMaxMsg, seriesMaxMsg)
+            }
         }
 
         val rawMovieLeaves =
@@ -979,6 +1026,13 @@ object ChannelCatalogBuilder {
         }
 
         result.addAll(existingSeriesByKey.values)
+
+        // Sort items so newest uploads appear first (Telegram messageId is monotonically increasing)
+        result.sortByDescending { item ->
+            val movieMaxMsg = item.parts.maxOfOrNull { it.messageId } ?: 0L
+            val seriesMaxMsg = item.episodes.flatMap { it.parts }.maxOfOrNull { it.messageId } ?: 0L
+            maxOf(movieMaxMsg, seriesMaxMsg)
+        }
 
         return result
     }

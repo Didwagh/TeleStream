@@ -66,9 +66,25 @@ class StreamService : Service() {
         // Idempotent - MainActivity also calls this, but the service can
         // in principle start first, and ChannelCatalogBuilder needs a
         // Context to read/write its on-disk catalog cache.
+        FileLogger.init(applicationContext)
         ChannelCatalogBuilder.init(applicationContext)
         DataUsageTracker.init(applicationContext)
         LocalStorageManager.init(applicationContext)
+
+        val prefs = getSharedPreferences("tgserver_prefs", MODE_PRIVATE)
+        val apiId = prefs.getInt("api_id", 0)
+        val apiHash = prefs.getString("api_hash", "") ?: ""
+        if (apiId != 0 && apiHash.isNotEmpty()) {
+            try {
+                TelegramClient.init(applicationContext, apiId, apiHash)
+                val tmdbKey = prefs.getString("tmdb_api_key", "") ?: ""
+                val geminiKey = prefs.getString("gemini_api_key", "") ?: ""
+                TmdbClient.init(tmdbKey)
+                GeminiClient.init(geminiKey)
+            } catch (t: Throwable) {
+                FileLogger.error("StreamService: failed to init Telegram/TMDB/Gemini clients", t)
+            }
+        }
         createChannel()
     }
 

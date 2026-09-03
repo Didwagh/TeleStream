@@ -510,33 +510,6 @@ class MainActivity : AppCompatActivity() {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ).also { it.topMargin = dp(10) })
 
-        val freeSpaceButton = secondaryButton("Free Up Space (clear downloaded video cache)") {
-            Toast.makeText(this, "Freeing up space...", Toast.LENGTH_SHORT).show()
-            TelegramClient.optimizeStorage { bytesFreed, filesDeleted ->
-                runOnUiThread {
-                    Toast.makeText(
-                        this,
-                        "Freed ${formatBytes(bytesFreed)} across $filesDeleted file(s)",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-            }
-        }
-        dataCard.addView(freeSpaceButton, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ).also { it.topMargin = dp(8) })
-
-        val freeSpaceNote = TextView(this).apply {
-            text = "This deletes downloaded video bytes sitting on disk to reclaim storage - it doesn't " +
-                "touch the usage counter above, which tracks network data over time, not current disk " +
-                "space. Your Telegram login and catalog aren't affected."
-            textSize = 11f
-            setTextColor(Theme.textMuted)
-        }
-        dataCard.addView(freeSpaceNote, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ).also { it.topMargin = dp(6) })
-
         val capLabel = TextView(this).apply {
             text = "Cap (MB, 0 = unlimited)"
             setTextColor(Theme.textMuted)

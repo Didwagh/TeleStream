@@ -11,6 +11,7 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
@@ -67,6 +68,7 @@ class StreamService : Service() {
         // Context to read/write its on-disk catalog cache.
         ChannelCatalogBuilder.init(applicationContext)
         DataUsageTracker.init(applicationContext)
+        LocalStorageManager.init(applicationContext)
         createChannel()
     }
 
@@ -97,8 +99,27 @@ class StreamService : Service() {
             server = LocalStreamServer(PORT).also { it.start(10_000, false) }
             isRunning = true
             warmUpCatalog()
+            startLocalStorageEnforcement()
         }
         return START_STICKY
+    }
+
+    /**
+     * Enforces the configured local-storage cap once immediately, then
+     * every 10 minutes for as long as the server keeps running - matches
+     * what Settings tells you this does. TDLib's own OptimizeStorage
+     * (used inside LocalStorageManager) removes least-recently-used files
+     * first and skips anything downloaded in the last minute, so this
+     * can't rip buffered-ahead data out from under something you're
+     * actively watching.
+     */
+    private fun startLocalStorageEnforcement() {
+        serviceScope.launch {
+            while (isRunning) {
+                LocalStorageManager.enforceNow()
+                delay(10 * 60 * 1000L)
+            }
+        }
     }
 
     /**

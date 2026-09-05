@@ -5,6 +5,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeout
+import org.drinkless.tdlib.TdApi
+import java.io.ByteArrayInputStream
+import java.io.File
 import java.io.InputStream
 import java.util.concurrent.ConcurrentHashMap
 
@@ -38,6 +43,7 @@ private class ChunkBridgeInputStream(
  * GET /search?channel_id=X&query=Y    - filters the cached catalog
  * GET /warmup?chat_id=X&message_id=Y  - kicks off a low-priority prefetch
  * GET /prefetch?chat_id=X&message_id=Y - legacy head/tail prefetch
+ * GET /subtitle?chat_id=X&message_id=Y - fetches a full subtitle file
  *
  * This is the ONLY HTTP server in the app. It is deliberately built on
  * NanoHTTPD + ChunkBridge rather than a hand-rolled socket parser, because
@@ -70,11 +76,65 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
             "/search" -> serveSearch(session)
             "/warmup" -> serveWarmup(session)
             "/prefetch" -> servePrefetch(session)
+            "/subtitle" -> serveSubtitle(session)
             else -> {
                 FileLogger.log("Unknown route requested: ${session.uri}")
                 newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "not found")
             }
         }
+    }
+
+    /**
+     * Subtitle files are small (KBs, not GBs) - rather than routing them
+     * through ChunkBridge's chunked-streaming machinery (built for
+     * multi-GB video), this just blocks until the whole file is
+     * downloaded and returns it in one response. Bounded by a 20s
+     * timeout, generous for a file this size.
+     */
+    private fun serveSubtitle(session: IHTTPSession): Response {
+        val chatId = session.parameters["chat_id"]?.firstOrNull()?.toLongOrNull()
+        val messageId = session.parameters["message_id"]?.firstOrNull()?.toLongOrNull()
+        if (chatId == null || messageId == null) {
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "missing chat_id/message_id")
+        }
+
+        return try {
+            val bytes = runBlocking {
+                withTimeout(20_000) {
+                    downloadSubtitleFully(chatId, messageId)
+                }
+            }
+            val name = session.parameters["name"]?.firstOrNull() ?: ""
+            val contentType = if (name.endsWith(".vtt", ignoreCase = true)) "text/vtt" else "application/x-subrip"
+            newFixedLengthResponse(Response.Status.OK, contentType, ByteArrayInputStream(bytes), bytes.size.toLong())
+        } catch (e: Exception) {
+            FileLogger.error("Subtitle fetch failed for chatId=$chatId messageId=$messageId", e)
+            newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "subtitle fetch failed: ${e.message}")
+        }
+    }
+
+    private suspend fun downloadSubtitleFully(chatId: Long, messageId: Long): ByteArray {
+        val file = TelegramFileResolver.resolve(chatId, messageId)
+        val client = TelegramClient.rawClient()
+
+        if (file.local.isDownloadingCompleted) {
+            return File(file.local.path).readBytes()
+        }
+
+        val downloaded = suspendCancellableCoroutine<TdApi.File> { cont ->
+            lateinit var listener: (TdApi.File) -> Unit
+            listener = { f ->
+                if (f.id == file.id && f.local.isDownloadingCompleted && cont.isActive) {
+                    TelegramClient.removeFileListener(file.id, listener)
+                    cont.resume(f)
+                }
+            }
+            TelegramClient.addFileListener(file.id, listener)
+            cont.invokeOnCancellation { TelegramClient.removeFileListener(file.id, listener) }
+            client.send(TdApi.DownloadFile(file.id, 32, 0, 0, false)) { }
+        }
+
+        return File(downloaded.local.path).readBytes()
     }
 
     /**

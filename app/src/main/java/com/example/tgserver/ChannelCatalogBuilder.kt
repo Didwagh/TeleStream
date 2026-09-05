@@ -31,7 +31,11 @@ data class EpisodeEntry(
     // into the series bucket anyway (a "combined" whole-series/season
     // file, or a Gemini-classified series). Lets the client show
     // something more honest than a fake "Episode 1".
-    val label: String? = null
+    val label: String? = null,
+    // Sibling .srt/.vtt/.ass/.ssa files uploaded alongside this episode's
+    // video, matched by filename (see subtitleBaseKeyCandidates() in
+    // sync()). Empty when nothing matched - not every release has these.
+    val subtitles: List<FilePart> = emptyList()
 )
 
 data class ChannelItem(
@@ -47,7 +51,11 @@ data class ChannelItem(
     val rating: Double? = null,
     val runtimeMinutes: Int? = null,
     val genres: List<String> = emptyList(),
-    val cast: List<String> = emptyList()
+    val cast: List<String> = emptyList(),
+    // Only meaningful for movies (type == MOVIE) - a series' subtitles
+    // live per-episode on EpisodeEntry.subtitles instead, since each
+    // episode is its own file with its own possible sibling subtitle.
+    val subtitles: List<FilePart> = emptyList()
 )
 
 data class CatalogStats(
@@ -92,6 +100,23 @@ object ChannelCatalogBuilder {
     private val trailingContainerExt =
         Regex(
             """\.(mkv|mp4|avi|mov|ts|webm|m4v)$""",
+            RegexOption.IGNORE_CASE
+        )
+
+    private val subtitleExtension =
+        Regex(
+            """\.(srt|vtt|ass|ssa)$""",
+            RegexOption.IGNORE_CASE
+        )
+
+    // Common trailing "which language is this" token some uploaders
+    // append to a subtitle's filename that a video file never has, e.g.
+    // "Movie.2024.1080p.English.srt" vs. the video's own
+    // "Movie.2024.1080p.mkv". Stripped as a second attempt when a
+    // subtitle's filename doesn't match a video's base key outright.
+    private val subtitleLanguageTag =
+        Regex(
+            """\.(english|eng|hindi|hin|multi|dual|esub|esubs|sub|subs)$""",
             RegexOption.IGNORE_CASE
         )
 
@@ -315,6 +340,14 @@ object ChannelCatalogBuilder {
 
         put("parts", partsArr)
 
+        val itemSubsArr = JSONArray()
+
+        item.subtitles.forEach {
+            itemSubsArr.put(partToJson(it))
+        }
+
+        put("subtitles", itemSubsArr)
+
         val episodesArr = JSONArray()
 
         item.episodes.forEach { ep ->
@@ -370,6 +403,17 @@ object ChannelCatalogBuilder {
                 epParts
             )
 
+            val epSubsArr = JSONArray()
+
+            ep.subtitles.forEach {
+                epSubsArr.put(partToJson(it))
+            }
+
+            epObj.put(
+                "subtitles",
+                epSubsArr
+            )
+
             episodesArr.put(
                 epObj
             )
@@ -407,13 +451,16 @@ object ChannelCatalogBuilder {
         return try {
             val partsArr = o.optJSONArray("parts") ?: JSONArray()
             val parts = (0 until partsArr.length()).mapNotNull { partFromJson(partsArr.optJSONObject(it)) }
+            val subsArr = o.optJSONArray("subtitles") ?: JSONArray()
+            val subs = (0 until subsArr.length()).mapNotNull { partFromJson(subsArr.optJSONObject(it)) }
             EpisodeEntry(
                 season = o.optInt("season", 1),
                 episode = o.optInt("episode", 1),
                 episodeEnd = if (o.isNull("episode_end")) null else o.optInt("episode_end"),
                 totalSize = o.optLong("total_size"),
                 parts = parts,
-                label = if (o.isNull("label")) null else o.optString("label")
+                label = if (o.isNull("label")) null else o.optString("label"),
+                subtitles = subs
             )
         } catch (e: Exception) {
             null
@@ -425,6 +472,9 @@ object ChannelCatalogBuilder {
         return try {
             val partsArr = o.optJSONArray("parts") ?: JSONArray()
             val parts = (0 until partsArr.length()).mapNotNull { partFromJson(partsArr.optJSONObject(it)) }
+
+            val itemSubsArr = o.optJSONArray("subtitles") ?: JSONArray()
+            val itemSubs = (0 until itemSubsArr.length()).mapNotNull { partFromJson(itemSubsArr.optJSONObject(it)) }
 
             val episodesArr = o.optJSONArray("episodes") ?: JSONArray()
             val episodes = (0 until episodesArr.length()).mapNotNull { episodeFromJson(episodesArr.optJSONObject(it)) }
@@ -444,6 +494,7 @@ object ChannelCatalogBuilder {
                 totalSize = o.optLong("total_size"),
                 parts = parts,
                 episodes = episodes,
+                subtitles = itemSubs,
                 overview = if (o.isNull("overview")) null else o.optString("overview"),
                 rating = if (o.isNull("rating")) null else o.optDouble("rating"),
                 runtimeMinutes = if (o.isNull("runtime_minutes")) null else o.optInt("runtime_minutes"),
@@ -509,7 +560,8 @@ object ChannelCatalogBuilder {
     private data class LeafUnit(
         val parts: List<FilePart>,
         val totalSize: Long,
-        val parsed: TitleParser.Parsed
+        val parsed: TitleParser.Parsed,
+        val subtitles: List<FilePart> = emptyList()
     )
 
     /**
@@ -549,6 +601,14 @@ object ChannelCatalogBuilder {
                 String,
                 MutableList<Triple<String, Long, Long>>
             >()
+
+        // Subtitle files (.srt/.vtt/.ass/.ssa) get pulled out of the
+        // normal grouping above and matched to a video's base key
+        // separately, in a pass after the walk below - otherwise a
+        // subtitle uploaded as its own message becomes its own bogus
+        // "movie" entry (TitleParser has no idea it's not media).
+        val rawSubtitles =
+            mutableListOf<Triple<String, Long, Long>>()
 
         var fromMessageId = 0L
         var fetched = 0
@@ -658,6 +718,17 @@ object ChannelCatalogBuilder {
                         else -> continue
                     }
 
+                if (subtitleExtension.containsMatchIn(fileName)) {
+                    rawSubtitles.add(
+                        Triple(
+                            fileName,
+                            fileSize.toLong(),
+                            message.id
+                        )
+                    )
+                    continue
+                }
+
                 val baseName =
                     splitFileSuffix.replace(
                         fileName,
@@ -691,6 +762,49 @@ object ChannelCatalogBuilder {
             "ChannelCatalogBuilder: sync found ${grouped.values.sumOf { it.size }} new file message(s) " +
                 "across ${grouped.size} group(s)"
         )
+
+        // Match each subtitle to a video's group key: first try its
+        // filename as-is (minus the subtitle extension), then try again
+        // with a trailing language tag stripped too (see
+        // subtitleLanguageTag's comment). Anything that still doesn't
+        // match any group this sync knows about is dropped rather than
+        // becoming its own bogus catalog entry.
+        val subtitlesByGroupKey = LinkedHashMap<String, MutableList<FilePart>>()
+        var unmatchedSubtitleCount = 0
+
+        rawSubtitles.forEach { (fileName, fileSize, msgId) ->
+            val withoutSubExt = subtitleExtension.replace(fileName, "")
+            val candidateKeys =
+                listOf(
+                    withoutSubExt.lowercase(),
+                    subtitleLanguageTag.replace(withoutSubExt, "").lowercase()
+                ).distinct()
+
+            val matchedKey = candidateKeys.firstOrNull { grouped.containsKey(it) }
+
+            if (matchedKey != null) {
+                subtitlesByGroupKey
+                    .getOrPut(matchedKey) { mutableListOf() }
+                    .add(
+                        FilePart(
+                            originalName = fileName,
+                            size = fileSize,
+                            chatId = chatId,
+                            messageId = msgId,
+                            label = ""
+                        )
+                    )
+            } else {
+                unmatchedSubtitleCount++
+            }
+        }
+
+        if (rawSubtitles.isNotEmpty()) {
+            FileLogger.log(
+                "ChannelCatalogBuilder: matched ${rawSubtitles.size - unmatchedSubtitleCount}/${rawSubtitles.size} " +
+                    "subtitle file(s) to a video; $unmatchedSubtitleCount unmatched (skipped, not a video's sibling)"
+            )
+        }
 
         val newLeaves =
             grouped.map { (baseKey, fileEntries) ->
@@ -739,7 +853,8 @@ object ChannelCatalogBuilder {
                         parts.sumOf {
                             it.size
                         },
-                    parsed = parsed
+                    parsed = parsed,
+                    subtitles = subtitlesByGroupKey[baseKey] ?: emptyList()
                 )
             }
 
@@ -918,6 +1033,7 @@ object ChannelCatalogBuilder {
                     totalSize = leaf.totalSize,
                     parts = leaf.parts,
                     episodes = emptyList(),
+                    subtitles = leaf.subtitles,
                     overview = match?.overview,
                     rating = match?.rating,
                     runtimeMinutes = match?.runtimeMinutes,
@@ -995,7 +1111,8 @@ object ChannelCatalogBuilder {
                                     "Full Series (Single File)"
                                 } else {
                                     null
-                                }
+                                },
+                            subtitles = leaf.subtitles
                         )
                     }
 

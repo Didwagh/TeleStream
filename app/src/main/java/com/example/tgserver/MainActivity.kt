@@ -650,41 +650,6 @@ class MainActivity : AppCompatActivity() {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ).also { it.topMargin = dp(8) })
 
-        val systemLabel = TextView(this).apply {
-            text = "SYSTEM"
-            textSize = 12f
-            setTextColor(Theme.accent)
-            setTypeface(typeface, Typeface.BOLD)
-            letterSpacing = 0.06f
-        }
-        col.addView(systemLabel, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ).also { it.topMargin = dp(18) })
-
-        val bootCard = card()
-        var isAutoStart = prefs.getBoolean("pref_auto_start_on_boot", true)
-        val bootDesc = TextView(this).apply {
-            text = if (isAutoStart) "Auto-Start on Boot: ENABLED\nServer starts automatically after device reboot" else "Auto-Start on Boot: DISABLED\nServer only runs when started manually"
-            setTextColor(Theme.textPrimary)
-            textSize = 13f
-        }
-        bootCard.addView(bootDesc)
-
-        lateinit var toggleBootBtn: Button
-        toggleBootBtn = secondaryButton(if (isAutoStart) "Disable Auto-Start on Boot" else "Enable Auto-Start on Boot") {
-            isAutoStart = !isAutoStart
-            prefs.edit().putBoolean("pref_auto_start_on_boot", isAutoStart).apply()
-            bootDesc.text = if (isAutoStart) "Auto-Start on Boot: ENABLED\nServer starts automatically after device reboot" else "Auto-Start on Boot: DISABLED\nServer only runs when started manually"
-            toggleBootBtn.text = if (isAutoStart) "Disable Auto-Start on Boot" else "Enable Auto-Start on Boot"
-            Toast.makeText(this, if (isAutoStart) "Auto-start on boot enabled" else "Auto-start on boot disabled", Toast.LENGTH_SHORT).show()
-        }
-        bootCard.addView(toggleBootBtn, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ).also { it.topMargin = dp(8) })
-        col.addView(bootCard, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ).also { it.topMargin = dp(8) })
-
         val saveButton = orangeButton("Save Settings") { onSaveSettings() }
         col.addView(saveButton, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
@@ -704,27 +669,6 @@ class MainActivity : AppCompatActivity() {
         return ScrollView(this).apply {
             setBackgroundColor(Theme.bg)
             addView(col)
-        }
-    }
-
-    private fun formatRelativeTime(timestamp: Long): String {
-        if (timestamp <= 0L) return "Never"
-        val diff = System.currentTimeMillis() - timestamp
-        if (diff < 0) return "Just now"
-        val seconds = diff / 1000
-        val minutes = seconds / 60
-        val hours = minutes / 60
-        val days = hours / 24
-
-        return when {
-            seconds < 60 -> "Just now"
-            minutes < 60 -> "$minutes min ago"
-            hours < 24 -> "$hours hr${if (hours == 1L) "" else "s"} ago"
-            days < 7 -> "$days day${if (days == 1L) "" else "s"} ago"
-            else -> {
-                val sdf = SimpleDateFormat("MMM d, yyyy HH:mm", Locale.getDefault())
-                sdf.format(Date(timestamp))
-            }
         }
     }
 
@@ -1167,20 +1111,6 @@ class MainActivity : AppCompatActivity() {
         container = savedContainer
         addSpaced(statusCard, topMarginDp = 8)
 
-        val channelId = prefs.getLong("channel_id", 0L)
-        val stats = if (channelId != 0L) ChannelCatalogBuilder.getCatalogStats(channelId) else null
-        if (stats != null && (stats.movieCount > 0 || stats.seriesCount > 0)) {
-            val statsCard = card()
-            container = statsCard
-            val movieText = "${stats.movieCount} movie${if (stats.movieCount == 1) "" else "s"}"
-            val seriesText = "${stats.seriesCount} series (${stats.episodeCount} ep${if (stats.episodeCount == 1) "" else "s"})"
-            statusRow("Catalog Items", "$movieText · $seriesText", true)
-            statusRow("Total Media Size", formatBytes(stats.totalSizeBytes), true)
-            statusRow("Last Synced", formatRelativeTime(stats.lastSyncTimestamp), true)
-            container = savedContainer
-            addSpaced(statsCard, topMarginDp = 8)
-        }
-
         val toggleButton = orangeButton(
             if (StreamService.isRunning) "Stop Server" else "Start Server"
         ) {
@@ -1228,16 +1158,7 @@ class MainActivity : AppCompatActivity() {
                 return@launch
             }
 
-            val updatedStats = ChannelCatalogBuilder.getCatalogStats(channelId)
-            val statsSummary = if (updatedStats != null) {
-                "${updatedStats.movieCount} movie${if (updatedStats.movieCount == 1) "" else "s"} · " +
-                    "${updatedStats.seriesCount} series (${updatedStats.episodeCount} ep) · " +
-                    formatBytes(updatedStats.totalSizeBytes) + " · synced " +
-                    formatRelativeTime(updatedStats.lastSyncTimestamp)
-            } else {
-                "${items.size} item(s)"
-            }
-            sectionLabel(statsSummary)
+            sectionLabel("${items.size} item(s)")
             val resultsCard = card()
             items.forEachIndexed { index, item ->
                 val row = TextView(this@MainActivity).apply {

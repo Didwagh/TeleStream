@@ -36,6 +36,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("org.nanohttpd:nanohttpd:2.3.1")
+    implementation("com.google.zxing:core:3.5.3")
     // TDLib is NOT pulled as a dependency here - it's vendored directly as
     // source (TdApi.java, Client.java) plus native .so files under jniLibs/,
     // because this build isn't published to any Maven/JitPack coordinate.

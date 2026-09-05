@@ -37,7 +37,9 @@ class ChunkBridge(
     private val fileId: Int,
     private val fileSize: Long,
     private val steadyChunkSize: Long = 3L * 1024 * 1024,
-    private val firstChunkSize: Long = 512L * 1024
+    private val firstChunkSize: Long = 512L * 1024,
+    private val chatId: Long = 0,
+    private val messageId: Long = 0
 ) {
     companion object {
         // Caps how many speculative (warmup/prefetch) downloads run at
@@ -197,6 +199,7 @@ class ChunkBridge(
                                     lastAccountedBytes = totalDownloaded
                                 }
                             }
+                            StreamingStatsTracker.reportDownloadedBytes(chatId, messageId, totalDownloaded)
 
                             TelegramClient.removeFileListener(fileId, listener)
                             cont.resume(Unit)

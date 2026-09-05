@@ -650,6 +650,34 @@ class MainActivity : AppCompatActivity() {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ).also { it.topMargin = dp(8) })
 
+        val batteryLabel = TextView(this).apply {
+            text = "SYSTEM RESTRICTIONS"
+            textSize = 12f
+            setTextColor(Theme.accent)
+            setTypeface(typeface, Typeface.BOLD)
+            letterSpacing = 0.06f
+        }
+        col.addView(batteryLabel, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(18) })
+
+        val batteryCard = card()
+        val batteryNote = TextView(this).apply {
+            text = "Aggressive battery optimization on some devices may kill the server in the background."
+            textSize = 12f
+            setTextColor(Theme.textMuted)
+        }
+        batteryCard.addView(batteryNote)
+        val batteryButton = secondaryButton("Disable Battery Restrictions") {
+            requestIgnoreBatteryOptimizations()
+        }
+        batteryCard.addView(batteryButton, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(10) })
+        col.addView(batteryCard, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(8) })
+
         val saveButton = orangeButton("Save Settings") { onSaveSettings() }
         col.addView(saveButton, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
@@ -1124,6 +1152,72 @@ class MainActivity : AppCompatActivity() {
         }
         addSpaced(toggleButton, topMarginDp = 18)
 
+        val wifiIp = getLocalWifiIp()
+        if (wifiIp != null && StreamService.isRunning) {
+            sectionLabel("Network")
+            val networkCard = card()
+            val wifiUrl = "http://$wifiIp:${StreamService.PORT}"
+            val urlView = TextView(this).apply {
+                text = wifiUrl
+                textSize = 14f
+                setTextColor(Theme.textPrimary)
+                setTypeface(typeface, Typeface.BOLD)
+            }
+            networkCard.addView(urlView)
+            
+            val netButtonsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            val copyBtn = secondaryButton("Copy IP") {
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val clip = ClipData.newPlainText("TeleStream IP", wifiUrl)
+                clipboard.setPrimaryClip(clip)
+                Toast.makeText(this@MainActivity, "Copied IP to clipboard", Toast.LENGTH_SHORT).show()
+            }
+            val qrBtn = secondaryButton("Show QR") {
+                showQrCode(wifiUrl)
+            }
+            netButtonsRow.addView(copyBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            netButtonsRow.addView(qrBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).also { it.marginStart = dp(6) })
+            networkCard.addView(netButtonsRow, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).also { it.topMargin = dp(10) })
+            
+            addSpaced(networkCard, topMarginDp = 8)
+        }
+
+        sectionLabel("Now Streaming")
+        val streamingCard = card()
+        val streamTitleView = TextView(this).apply {
+            text = "Idle"
+            textSize = 14f
+            setTextColor(Theme.textPrimary)
+            setTypeface(typeface, Typeface.BOLD)
+        }
+        val streamStatsView = TextView(this).apply {
+            text = "No active stream"
+            textSize = 12f
+            setTextColor(Theme.textMuted)
+        }
+        streamingCard.addView(streamTitleView)
+        streamingCard.addView(streamStatsView, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(4) })
+        addSpaced(streamingCard, topMarginDp = 8)
+
+        lifecycleScope.launch {
+            StreamingStatsTracker.stats.collect { stats ->
+                if (stats.chatId != 0L) {
+                    streamTitleView.text = stats.title.ifEmpty { "Unknown Title" }
+                    val speed = formatBytes(stats.speedBytesPerSecond) + "/s"
+                    val buffer = formatBytes(stats.downloadedBytes)
+                    val total = formatBytes(stats.fileSize)
+                    streamStatsView.text = "Buffer: $buffer / $total  •  Speed: $speed"
+                } else {
+                    streamTitleView.text = "Idle"
+                    streamStatsView.text = "No active stream"
+                }
+            }
+        }
+
         sectionLabel("Catalog")
         val fetchButton = orangeButton("Refresh Catalog") { fetchAndShowCatalog(fullRebuild = false) }
         addSpaced(fetchButton, topMarginDp = 8)
@@ -1174,6 +1268,64 @@ class MainActivity : AppCompatActivity() {
                 resultsCard.addView(row, lp)
             }
             addSpaced(resultsCard, topMarginDp = 8)
+        }
+    private fun getLocalWifiIp(): String? {
+        try {
+            val en = java.net.NetworkInterface.getNetworkInterfaces()
+            while (en.hasMoreElements()) {
+                val intf = en.nextElement()
+                if (intf.isLoopback || !intf.isUp) continue
+                val enumIpAddr = intf.inetAddresses
+                while (enumIpAddr.hasMoreElements()) {
+                    val inetAddress = enumIpAddr.nextElement()
+                    if (!inetAddress.isLoopbackAddress && inetAddress is java.net.Inet4Address) {
+                        return inetAddress.hostAddress
+                    }
+                }
+            }
+        } catch (ex: Exception) {
+            FileLogger.error("Failed to get Wi-Fi IP", ex)
+        }
+        return null
+    }
+
+    private fun showQrCode(text: String) {
+        try {
+            val width = 600
+            val height = 600
+            val bitMatrix = com.google.zxing.qrcode.QRCodeWriter().encode(
+                text, com.google.zxing.BarcodeFormat.QR_CODE, width, height
+            )
+            val bmp = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.RGB_565)
+            for (x in 0 until width) {
+                for (y in 0 until height) {
+                    bmp.setPixel(x, y, if (bitMatrix.get(x, y)) Color.BLACK else Color.WHITE)
+                }
+            }
+            val imageView = ImageView(this).apply {
+                setImageBitmap(bmp)
+                setPadding(dp(16), dp(16), dp(16), dp(16))
+            }
+            val dialog = android.app.AlertDialog.Builder(this)
+                .setTitle("Scan to Stream")
+                .setView(imageView)
+                .setPositiveButton("Close", null)
+                .create()
+            dialog.show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Failed to generate QR Code", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun requestIgnoreBatteryOptimizations() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val intent = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+            intent.data = Uri.parse("package:$packageName")
+            try {
+                startActivity(intent)
+            } catch (e: Exception) {
+                Toast.makeText(this, "Cannot open battery settings automatically.", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 }

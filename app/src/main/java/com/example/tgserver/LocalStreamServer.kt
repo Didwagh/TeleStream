@@ -359,6 +359,10 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
             return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "resolve failed: ${e.message}")
         }
 
+        val cached = ChannelCatalogBuilder.peekCache(chatId)
+        val title = cached?.find { it.messageId == messageId }?.title ?: "Unknown Title"
+        StreamingStatsTracker.setActiveStream(chatId, messageId, title, entry.fileSize)
+
         val rangeHeader = session.headers["range"]
         val (start, endInclusive) = if (rangeHeader != null) {
             parseRange(rangeHeader, entry.fileSize)
@@ -383,7 +387,7 @@ class LocalStreamServer(port: Int) : NanoHTTPD(port) {
         return cache.computeIfAbsent(key) {
             val file = runBlocking { TelegramFileResolver.resolve(chatId, messageId) }
             val fileSize = file.size.toLong()
-            Entry(ChunkBridge(file.id, fileSize), fileSize)
+            Entry(ChunkBridge(file.id, fileSize, chatId = chatId, messageId = messageId), fileSize)
         }
     }
 
